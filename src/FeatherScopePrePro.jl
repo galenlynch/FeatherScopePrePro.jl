@@ -346,7 +346,7 @@ function feather_video_read_demin_audio(videof::AbstractString, thr::Real,
     videomatch = match(FEATHER_VIDEO_REG, videof)
     videomatch === nothing && throw(ArgumentError("Could not parse $videof to find its datetime"))
     searchreg = sync_searchreg(videomatch)
-    searchdir, _ = splitdir(videof)
+    searchdir = splitdir(videof)[1]
     if isempty(searchdir)
         dirlisting = readdir()
     else
