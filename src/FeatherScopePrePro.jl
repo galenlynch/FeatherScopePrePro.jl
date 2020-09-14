@@ -5,10 +5,11 @@ using CaProcessing: clip_segments_thr, clip_imgs, demin, map_to_8bit, PixelLUT,
 using GLUtilities: ndx_to_t, t_to_ndx, clip_ndx
 using ColorTypes: Gray, RGB
 using DataStructures: OrderedDict
+
 using FeatherscopeExtraction: convert_feather_video_frames, check_slices,
     convert_featherscope_rgb, feather_video_min_frame_planning, open_audio_sync,
-    FEATHER_VIDEO_REG, FEATHER_SYNC_REG, sync_searchreg
-using FeatherScope: find_shutter_openings, find_sync_edges
+    FEATHER_VIDEO_REG, FEATHER_SYNC_REG, sync_searchreg, video_sync_alignment
+
 using FileIO: save
 using FixedPointNumbers: Normed # need reinterpret method
 using ImageCore: colorview
@@ -266,32 +267,11 @@ end
 
 function feather_sync_add_audio(syncf, new_fnames, exposed_ranges, framerate,
                                 writedir, shutter_offset, fs_sync, force_video,
-                                nexposed, first_exposure_nosync; sync_thr = 0.1,
-                                shutter_thr = 0.1)
+                                nexposed; kwargs...)
     # Find sync edges
     syncdata = open_audio_sync(syncf)
-    shutter_edges = find_shutter_openings(syncdata, shutter_thr)
-    sync_edges = find_sync_edges(syncdata, sync_thr)
-
-    # Find the time from the beginning of the original video file of the first
-    # exposed frame that can be sync'd
-    first_sync_exposure_no = ifelse(first_exposure_nosync, 2, 1)
-    video_exposure_time = ndx_to_t(first(exposed_ranges[first_sync_exposure_no]),
-                                   framerate)
-
-    # Find the time from the beginning of the sync file of the corresponding
-    # shutter opening, and use it to find when the sync file starts, relative to
-    # the start of the video file.
-    if !isempty(sync_edges)
-        sync_shutter_no = searchsortedfirst(sync_edges, shutter_edges[1])
-        sync_exposure_no = sync_shutter_no + shutter_offset
-        sync_exposure_time = ndx_to_t(sync_edges[sync_exposure_no], fs_sync)
-        sync_start_time = sync_exposure_time - video_exposure_time
-    else # cannot work with sync, due to experimental error it is empty
-        shutter_open_time = ndx_to_t(shutter_edges[1], fs_sync)
-        shutter_exposure_time = shutter_open_time + shutter_offset / framerate
-        sync_start_time = shutter_exposure_time - video_exposure_time
-    end
+    sync_start_time = video_sync_alignment(syncdata, exposed_ranges, framerate;
+                                           kwargs...)
 
     # Loop over the separated video files and add the overlapping audio
     syncl = size(syncdata, 2)
@@ -345,11 +325,13 @@ function feather_video_read_demin_audio(videof::AbstractString,
     # cannot align the audio and should give up
     first_exposure_nosync = first(exposed_ranges[1]) == 1
     first_exposure_nosync && nexposed == 1 && return new_fnames
+    skip_exposures = ifelse(first_exposure_nosync, 1, 0)
 
     try
         feather_sync_add_audio(syncf, new_fnames, exposed_ranges, framerate,
                                writedir, shutter_offset, fs_sync, force_video,
-                               nexposed, first_exposure_nosync; kwargs...)
+                               nexposed, ; skip_exposures = skip_exposures,
+                               kwargs...)
     catch
         for f in new_fnames
             isfile(f) && rm(f)
