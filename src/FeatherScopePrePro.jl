@@ -25,7 +25,8 @@ import FFMPEG
 export avis_to_tiff_demin,
     avi_to_tiff_demin,
     avi_to_tiff_raw,
-    feather_video_read_demin_audio
+    feather_video_read_demin_audio,
+    feather_video_encode_demind_segments
 
 const AVI_REGEX = r"(?<file_prefix>.*)\.avi$"i
 const JSON_DICT_TYPE = OrderedDict{String, Any}
