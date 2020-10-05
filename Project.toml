@@ -1,7 +1,7 @@
 name = "FeatherScopePrePro"
 uuid = "37bac92b-e4c2-480a-b015-8005f9486f30"
 authors = ["Galen Lynch <galen.lynch@gmail.com>"]
-version = "0.1.0"
+version = "0.1.1"
 
 [deps]
 CaProcessing = "5d3dd9f5-cffe-4d9b-8768-e5b1153cff1e"
