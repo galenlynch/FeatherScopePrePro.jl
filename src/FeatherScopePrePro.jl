@@ -176,17 +176,7 @@ function append_demind_video_frame!(encoder_state, exposure_no, graybuf, img_raw
                                     exposed_range, min_frame, sub_maxv, fno,
                                     roi_xr, roi_yr, writedir, new_fname,
                                     framerate, props)
-    if encoder_state !== nothing
-        if fno in exposed_range # continue encode
-            demin_frame!(graybuf, img_raw, min_frame, encoder_state.lut, roi_xr,
-                         roi_yr)
-            append_frame!(encoder_state, graybuf, fno)
-        else # finish encode
-            finish_encode(encoder_state, writedir, new_fname, exposed_range, framerate)
-            encoder_state = nothing
-            exposure_no += 1
-        end
-    else
+    if encoder_state === nothing
         if fno in exposed_range
             io, s_fpath, encoder = start_encode(writedir, graybuf, framerate, props)
             lut = pixel_lut(x -> rescale_compress(UInt8, x, 1/reinterpret(sub_maxv)),
@@ -195,6 +185,16 @@ function append_demind_video_frame!(encoder_state, exposure_no, graybuf, img_raw
             demin_frame!(graybuf, img_raw, min_frame, encoder_state.lut, roi_xr,
                          roi_yr)
             append_frame!(encoder_state, graybuf, fno)
+        end
+    else
+        if fno in exposed_range # continue encode
+            demin_frame!(graybuf, img_raw, min_frame, encoder_state.lut, roi_xr,
+                         roi_yr)
+            append_frame!(encoder_state, graybuf, fno)
+        else # finish encode
+            finish_encode(encoder_state, writedir, new_fname, exposed_range, framerate)
+            encoder_state = nothing
+            exposure_no += 1
         end
     end
     encoder_state, exposure_no
@@ -266,12 +266,12 @@ function feather_video_read_demin(input_fname, thr, roi_x, roi_y, framerate,
                                          framerate, props, writedir)
 end
 
-function feather_sync_add_audio(syncf, new_fnames, exposed_ranges, framerate,
-                                writedir, shutter_offset, fs_sync, force_video,
-                                nexposed; kwargs...)
+function feather_sync_add_audio(syncf, new_fnames, exposed_ranges, sync_frameno,
+                                framerate, writedir, shutter_offset, fs_sync,
+                                force_video, nexposed; kwargs...)
     # Find sync edges
     syncdata = open_audio_sync(syncf)
-    sync_start_time = video_sync_alignment(syncdata, exposed_ranges, framerate;
+    sync_start_time = video_sync_alignment(syncdata, sync_frameno, framerate;
                                            kwargs...)
 
     # Loop over the separated video files and add the overlapping audio
@@ -314,24 +314,25 @@ function feather_video_read_demin_audio(videof::AbstractString,
     # Find exposed portions of the video and make subtracted videos
     min_frames, subtracted_maxvals, exposed_ranges, nf =
         feather_video_min_frame_planning(videof, thr, roi_x, roi_y)
+
+    # If the only exposed region is at the start of the video file, then we
+    # cannot align the audio and should give up
+    nexposed = length(exposed_ranges)
+    nexposed == 0 && return String[]
+    first_exposure_nosync = first(exposed_ranges[1]) == 1
+    first_exposure_nosync && nexposed == 1 && return String[]
+
     new_fnames = feather_video_encode_demind_segments(videof, roi_x, roi_y,
                                                       min_frames,
                                                       subtracted_maxvals,
                                                       exposed_ranges, framerate,
                                                       props, writedir)
-    nexposed = length(exposed_ranges)
-    nexposed > 0 || isempty(new_fnames) || return new_fnames
-
-    # If the only exposed region is at the start of the video file, then we
-    # cannot align the audio and should give up
-    first_exposure_nosync = first(exposed_ranges[1]) == 1
-    first_exposure_nosync && nexposed == 1 && return new_fnames
-    skip_exposures = ifelse(first_exposure_nosync, 1, 0)
-
+    sync_exposed_frameno = first_exposure_nosync ? exposed_ranges[2][1] :
+                                                   exposed_ranges[1][1]
     try
-        feather_sync_add_audio(syncf, new_fnames, exposed_ranges, framerate,
-                               writedir, shutter_offset, fs_sync, force_video,
-                               nexposed, ; skip_exposures = skip_exposures,
+        feather_sync_add_audio(syncf, new_fnames, exposed_ranges,
+                               sync_exposed_frameno, framerate, writedir,
+                               shutter_offset, fs_sync, force_video, nexposed;
                                kwargs...)
     catch
         for f in new_fnames
