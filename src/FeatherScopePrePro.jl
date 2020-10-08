@@ -154,8 +154,7 @@ function start_encode(writedir, graybuf, framerate, props)
     s_fpath = joinpath(writedir, "temp.stream")
     io = open(s_fpath, "w")
     writebuf = PermutedDimsArray(graybuf, (2,1))
-    encoder = prepareencoder(writebuf,
-                             framerate = framerate,
+    encoder = prepareencoder(writebuf, framerate = framerate,
                              AVCodecContextProperties = props)
     return io, s_fpath, encoder
 end
