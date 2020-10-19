@@ -8,10 +8,11 @@ using DataStructures: OrderedDict
 
 using FeatherscopeExtraction: convert_feather_video_frames, check_slices,
     convert_featherscope_rgb, feather_video_min_frame_planning, open_audio_sync,
-    FEATHER_VIDEO_REG, FEATHER_SYNC_REG, sync_searchreg, video_sync_alignment
+    FEATHER_VIDEO_REG, FEATHER_SYNC_REG, sync_searchreg, video_sync_alignment,
+    frame_iter_preamble
 
 using FileIO: save
-using FixedPointNumbers: Normed # need reinterpret method
+using FixedPointNumbers: Normed, N6f10, N0f8, N8f8, rawtype # need reinterpret method
 using ImageCore: colorview
 using JSON: json
 using WAV: wavwrite
@@ -143,8 +144,8 @@ function demin_frame!(graybuf, img_raw, min_frame, lut, roi_xr, roi_yr)
     end
 end
 
-struct FrameEncoderState
-    lut::PixelLUT{UInt8}
+struct FrameEncoderState{T}
+    lut::PixelLUT{T}
     io::IOStream
     s_fpath::String
     encoder::VideoEncoder
@@ -174,12 +175,19 @@ end
 function append_demind_video_frame!(encoder_state, exposure_no, graybuf, img_raw,
                                     exposed_range, min_frame, sub_maxv, fno,
                                     roi_xr, roi_yr, writedir, new_fname,
-                                    framerate, props)
+                                    framerate, props, use_gamma_compression)
     if encoder_state === nothing
         if fno in exposed_range
             io, s_fpath, encoder = start_encode(writedir, graybuf, framerate, props)
-            lut = pixel_lut(x -> rescale_compress(UInt8, x, 1/reinterpret(sub_maxv)),
-                            reinterpret(sub_maxv))
+            maxv_scale = 1 / sub_maxv
+            Tout = eltype(graybuf)
+            if use_gamma_compression
+                lut = pixel_lut(sub_maxv) do x
+                    rescale_compress(Tout, x, maxv_scale)
+                end
+            else
+                lut = pixel_lut(x -> convert(Tout, maxv_scale * x), sub_maxv)
+            end
             encoder_state = FrameEncoderState(lut, io, s_fpath, encoder)
             demin_frame!(graybuf, img_raw, min_frame, encoder_state.lut, roi_xr,
                          roi_yr)
@@ -204,65 +212,95 @@ function def_fname_f(bname, r)
     "$(bname_noext)_$(r[1])-$(r[end]).mp4"
 end
 
-function feather_video_encode_demind_segments(input_fname, roi_x, roi_y, min_frames,
-                                              subtracted_maxvals, exposed_ranges,
-                                              framerate, props, writedir = pwd();)
+function determine_demind_container_depth(maxval::N6f10)
+    maxval_8bit = reinterpret(N6f10, reinterpret(one(N8f8)))
+    maxval <= maxval_8bit ? N0f8 : N6f10
+end
+
+larger_container_type(::Type{T}, ::Type{T}) where T = T
+larger_container_type(::Type{Base.Bottom}, ::Type{T}) where T = T
+larger_container_type(::Type{T}, ::Type{Base.Bottom}) where T = T
+larger_container_type(::Type{Base.Bottom}, ::Type{Base.Bottom}) = Base.Bottom
+function larger_container_type(::Type{S}, ::Type{T}) where {S,T}
+    larger_container_type(larger_container_rule(S, T), larger_container_rule(T, S))
+end
+
+larger_container_rule(::Type{<:Any}, ::Type{<:Any}) = Base.Bottom
+function larger_container_rule(::Type{X}, ::Type{Y}) where {A, f, X<:Normed{A, f},
+                                                            B, g, Y<:Normed{B, g}}
+    if f < g
+        T = Y
+    elseif f == g
+        # Prefer smaller containers with the same bit depth
+        T = sizeof(A) < sizeof(B) ? X : Y
+    else
+        T = X
+    end
+    T
+end
+
+function max_container_depth(maxvals)
+    mapreduce(determine_demind_container_depth, larger_container_type,
+              maxvals, init = N0f8)
+end
+
+function feather_video_encode_demind_segments(input_fname, roi_x, roi_y,
+                                              min_frames, subtracted_maxvals,
+                                              exposed_ranges, framerate, props,
+                                              writedir = pwd();
+                                              use_gamma_compression = true)
     nexposure = length(exposed_ranges)
     nexposure > 0 || return String[]
     isdir(writedir) || throw(ArgumentError("Cannot access write directory $writedir"))
     base_name = basename(input_fname)
     video_names = def_fname_f.(base_name, exposed_ranges)
-    inputio = VideoIO.open(input_fname)
-    outs = try
-        inputvid = openvideo(inputio)
-        try
-            eof(inputvid) && return String[]
-            img_raw_p = VideoIO.read(inputvid)::PermutedDimsArray{RGB{Normed{UInt8,8}},2,(2, 1),(2, 1),Array{RGB{Normed{UInt8,8}},2}}
-            img_raw = parent(img_raw_p)
-            roi_xr, roi_yr = check_slices(img_raw, roi_x, roi_y)
-            nxr = length(roi_xr)
-            nyr = length(roi_yr)
-            graybuf = Matrix{UInt8}(undef, nxr, nyr)
-            encoder_state = nothing
-            fno = 1
-            exposure_no = 1
-            encoder_state, exposure_no = append_demind_video_frame!(
-                encoder_state, exposure_no, graybuf, img_raw,
-                exposed_ranges[exposure_no], min_frames[exposure_no],
-                subtracted_maxvals[exposure_no], fno, roi_xr, roi_yr, writedir,
-                video_names[exposure_no], framerate, props
-            )
-            while !eof(inputvid) && exposure_no <= nexposure
-                VideoIO.read!(inputvid, img_raw)
-                fno += 1
-                encoder_state, exposure_no = append_demind_video_frame!(
-                    encoder_state, exposure_no, graybuf, img_raw,
-                    exposed_ranges[exposure_no], min_frames[exposure_no],
-                    subtracted_maxvals[exposure_no], fno, roi_xr, roi_yr,
-                    writedir, video_names[exposure_no], framerate,
-                    props
-                )
-            end
-            if encoder_state !== nothing
-                finish_encode(encoder_state, writedir, video_names[exposure_no],
-                              exposed_ranges[nexposure], framerate)
-            end
-        finally
-            close(inputvid)
-        end
-    finally
-        close(inputio)
+
+    outs = frame_iter_preamble(input_fname, roi_x, roi_y)
+    outs === nothing && return String[]
+    inputvid, img_raw, roi_xr, roi_yr = outs
+    graytype = max_container_depth(subtracted_maxvals)
+    graybuf = similar(img_raw, graytype, length.((roi_xr, roi_yr)))
+
+    encoder_state = nothing
+    fno = 1
+    exposure_no = 1
+    encoder_state, exposure_no = append_demind_video_frame!(
+        encoder_state, exposure_no, graybuf, img_raw,
+        exposed_ranges[exposure_no], min_frames[exposure_no],
+        subtracted_maxvals[exposure_no], fno, roi_xr, roi_yr, writedir,
+        video_names[exposure_no], framerate, props, use_gamma_compression
+    )
+
+    while !eof(inputvid) && exposure_no <= nexposure
+        VideoIO.read!(inputvid, img_raw)
+        fno += 1
+        encoder_state, exposure_no = append_demind_video_frame!(
+            encoder_state, exposure_no, graybuf, img_raw,
+            exposed_ranges[exposure_no], min_frames[exposure_no],
+            subtracted_maxvals[exposure_no], fno, roi_xr, roi_yr,
+            writedir, video_names[exposure_no], framerate,
+            props, use_gamma_compression
+        )
     end
+
+    if encoder_state !== nothing
+        finish_encode(encoder_state, writedir, video_names[exposure_no],
+                      exposed_ranges[nexposure], framerate)
+    end
+
     return joinpath.(writedir, video_names)
 end
 
 function feather_video_read_demin(input_fname, thr, roi_x, roi_y, framerate,
-                                  props, writedir = pwd())
+                                  props, writedir = pwd();
+                                  use_gamma_compression = true)
     min_frames, subtracted_maxvals, exposed_ranges, nf =
         feather_video_min_frame_planning(input_fname, thr, roi_x, roi_y)
     feather_video_encode_demind_segments(input_fname, roi_x, roi_y, min_frames,
                                          subtracted_maxvals, exposed_ranges,
-                                         framerate, props, writedir)
+                                         framerate, props, writedir,
+                                         use_gamma_compression =
+                                         use_gamma_compression)
 end
 
 function feather_sync_add_audio(syncf, new_fnames, exposed_ranges, sync_frameno,
@@ -309,7 +347,7 @@ function feather_video_read_demin_audio(videof::AbstractString,
                                         roi_y, framerate, props,
                                         writedir = pwd(); shutter_offset = 1,
                                         fs_sync = 48000, force_video = false,
-                                        kwargs...)
+                                        use_gamma_compression = true, kwargs...)
     # Find exposed portions of the video and make subtracted videos
     min_frames, subtracted_maxvals, exposed_ranges, nf =
         feather_video_min_frame_planning(videof, thr, roi_x, roi_y)
@@ -325,7 +363,9 @@ function feather_video_read_demin_audio(videof::AbstractString,
                                                       min_frames,
                                                       subtracted_maxvals,
                                                       exposed_ranges, framerate,
-                                                      props, writedir)
+                                                      props, writedir,
+                                                      use_gamma_compression =
+                                                      use_gamma_compression)
     sync_exposed_frameno = first_exposure_nosync ? exposed_ranges[2][1] :
                                                    exposed_ranges[1][1]
     try
