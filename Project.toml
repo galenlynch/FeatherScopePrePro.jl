@@ -15,6 +15,7 @@ GLUtilities = "8b4c6747-1f02-570a-a961-a96037df41d6"
 ImageCore = "a09fc81d-aa75-5fe9-8630-4744c3626534"
 ImageMagick = "6218d12a-5da1-5696-b52f-db25d2ecc6d1"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 VideoIO = "d6d074c3-1acf-5d4c-9a43-ef38773959a2"
 WAV = "8149f6b0-98f6-5db9-b78f-408fbbb8ef88"
 
