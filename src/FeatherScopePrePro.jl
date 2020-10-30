@@ -1,21 +1,25 @@
 module FeatherScopePrePro
 
 using CaProcessing: clip_segments_thr, clip_imgs, demin, map_to_8bit, PixelLUT,
-    pixel_lut, rescale_compress
+    pixel_lut, rescale_compress, max_container_depth, frame_avg_intensity,
+    get_norm, frames_min_max_accum_alloc, frames_min_max_accum_init!,
+    frame_min_max_accum!, determine_container_depth, make_scale_f
 using GLUtilities: ndx_to_t, t_to_ndx, clip_ndx
 using ColorTypes: Gray, RGB
-using DataStructures: OrderedDict
+using DataStructures: OrderedDict, CircularBuffer, isfull
 
-using FeatherscopeExtraction: convert_feather_video_frames, check_slices,
-    convert_featherscope_rgb, feather_video_min_frame_planning, open_audio_sync,
-    FEATHER_VIDEO_REG, FEATHER_SYNC_REG, sync_searchreg, video_sync_alignment,
-    frame_iter_preamble
+using FeatherscopeExtraction: convert_feather_video_frames,
+    convert_featherscope_rgb, open_audio_sync, FEATHER_VIDEO_REG,
+    FEATHER_SYNC_REG, sync_searchreg, video_sync_alignment, frame_iter_preamble
 
 using FileIO: save
 using FixedPointNumbers: Normed, N6f10, N0f8, N8f8, rawtype # need reinterpret method
 using ImageCore: colorview
 using JSON: json
 using WAV: wavwrite, WAVE_FORMAT_PCM
+
+using Base.Threads: @spawn, nthreads
+using Base.Iterators: peel
 
 using Statistics: mean
 
@@ -28,14 +32,130 @@ import FFMPEG
 export avis_to_tiff_demin,
     avi_to_tiff_demin,
     avi_to_tiff_raw,
+    find_exposed_frame_ranges,
+    feather_video_encode_demind_segments,
+    feather_video_min_frame_planning,
     feather_video_read_demin_audio,
-    feather_video_encode_demind_segments
+    streaming_intensities
 
 const AVI_REGEX = r"(?<file_prefix>.*)\.avi$"i
 const JSON_DICT_TYPE = OrderedDict{String, Any}
 
+function finish_exposure!(min_frames, subtracted_maxvals, exposed_ranges,
+                          roi_max, roi_min, exposure_start, exposure_stop, nt)
+    subtr_mv = maxval_min_max_frames(roi_min, roi_max, nt)
+    push!(min_frames, copy(roi_min))
+    push!(subtracted_maxvals, subtr_mv)
+    push!(exposed_ranges, exposure_start:exposure_stop)
+end
+
+function _add_to_min_max_frames!(roi_max, roi_min, img_raw, roi_xr, roi_yr, yb,
+                                 ye)
+    @inbounds for yi in yb:ye
+        @simd ivdep for xi in eachindex(roi_xr)
+            intensity = reinterpret(N6f10,
+                                    convert_featherscope_rgb(img_raw[roi_xr[xi],
+                                                                     roi_yr[yi]]))
+            roi_max[xi, yi] = max(intensity, roi_max[xi, yi])
+            roi_min[xi, yi] = min(intensity, roi_min[xi, yi])
+        end
+    end
+end
+
+function add_to_min_max_frames!(roi_max, roi_min, img_raw, roi_xr, roi_yr, nt)
+    ny = length(roi_yr)
+    if nt > 1
+        blksize = cld(ny, nt)
+        tasks = Vector{Task}(undef, nt)
+        @inbounds for tno in 1:nt
+            lo = (tno - 1) * blksize + 1
+            hi = min(tno * blksize, ny)
+            tasks[tno] = @spawn _add_to_min_max_frames!(roi_max, roi_min,
+                                                        img_raw, roi_xr,
+                                                        roi_yr, lo, hi)
+        end
+        foreach(wait, tasks)
+    else
+        _add_to_min_max_frames!(roi_max, roi_min, img_raw, roi_xr, roi_yr, 1,
+                                 ny)
+    end
+end
+
+function exposure_incr!(roi_max, roi_min, min_frames, subtracted_maxvals,
+                        exposed_ranges, exposure_start, img_raw,
+                        in_exposure, fno, roi_xr, roi_yr, nt)
+    if exposure_start > 0 # in exposed period
+        if in_exposure # continue exposure
+            add_to_min_max_frames!(roi_max, roi_min, img_raw, roi_xr, roi_yr, nt)
+        else # end exposure
+            finish_exposure!(min_frames, subtracted_maxvals, exposed_ranges,
+                             roi_max, roi_min, exposure_start, fno - 1, nt)
+            exposure_start = 0
+        end
+    else # not in exposure period
+        if in_exposure # start exposure
+            fill!(roi_max, typemin(N6f10))
+            fill!(roi_min, typemax(N6f10))
+            add_to_min_max_frames!(roi_max, roi_min, img_raw, roi_xr, roi_yr, nt)
+            exposure_start = fno
+        end # do nothing if still not exposed
+    end
+    exposure_start
+end
+
+function check_slices(img, roi_x, roi_y)
+    checkbounds(img, roi_x, roi_y)
+    to_indices(img, (roi_x, roi_y))
+end
+
+function feather_video_min_frame_planning(input_fname, thr, roi_x = :,
+                                          roi_y = :; shutter_delay = 1,
+                                          nt = nthreads())
+    outs = frame_iter_preamble(input_fname)
+    outs === nothing && return
+    inputvid, img_raw  = outs
+    roi_xr, roi_yr = check_slices(img_raw, roi_x, roi_y)
+    norm = get_norm(roi_xr, roi_yr)
+    roi_max = Matrix{N6f10}(undef, length(roi_xr), length(roi_yr))
+    roi_min = similar(roi_max)
+
+    min_frames = Vector{typeof(roi_min)}()
+    subtracted_maxvals = Vector{N6f10}()
+    exposed_ranges = Vector{UnitRange{Int}}()
+
+    fno = 1
+    exposure_start = 0
+    is_exposed = determine_if_frame_exposed(img_raw, roi_xr, roi_yr,
+                                            norm, thr, nt)
+    nexposed = ifelse(is_exposed, 1, 0)
+    in_exposure = nexposed > shutter_delay
+    exposure_start = exposure_incr!(roi_max, roi_min, min_frames,
+                                    subtracted_maxvals, exposed_ranges,
+                                    exposure_start, img_raw,
+                                    in_exposure, fno, roi_xr,
+                                    roi_yr, nt)
+    while !eof(inputvid)
+        read!(inputvid, img_raw)
+        fno += 1
+        is_exposed = determine_if_frame_exposed(img_raw, roi_xr, roi_yr,
+                                                norm, thr, nt)
+        nexposed = ifelse(is_exposed, nexposed + 1, 0)
+        in_exposure = nexposed > shutter_delay
+        exposure_start = exposure_incr!(roi_max, roi_min, min_frames,
+                                        subtracted_maxvals,
+                                        exposed_ranges, exposure_start,
+                                        img_raw, in_exposure, fno,
+                                        roi_xr, roi_yr, nt)
+    end
+    if exposure_start > 0 # last frame was exposed, finish exposure
+        finish_exposure!(min_frames, subtracted_maxvals, exposed_ranges,
+                         roi_max, roi_min, exposure_start, fno, nt)
+    end
+    return min_frames, subtracted_maxvals, exposed_ranges, fno
+end
+
 function avis_to_tiff_demin(savedir, fnames, x, y, thr;
-                      scratch = tempdir(), nt = Threads.nthreads())
+                      scratch = tempdir(), nt = nthreads())
     for fname in fnames
         avi_to_tiff_demin(savedir, fname, x, y, thr, scratch = scratch)
     end
@@ -51,7 +171,7 @@ end
 function avi_to_tiff_demin(savedir::AbstractString, imgs::AbstractArray,
                            fname::AbstractString, x::AbstractRange,
                            y::AbstractRange, thr::Real;
-                           nt = Threads.nthreads(),
+                           nt = nthreads(),
                            name_f = default_name_conversion)
     # convert video and find exposed segments
     imgs_roi = clip_imgs(imgs, x = x, y = y)
@@ -211,38 +331,6 @@ function def_fname_f(bname, r)
     "$(bname_noext)_$(r[1])-$(r[end]).mp4"
 end
 
-function determine_demind_container_depth(maxval::N6f10)
-    maxval_8bit = reinterpret(N6f10, reinterpret(one(N8f8)))
-    maxval <= maxval_8bit ? N0f8 : N6f10
-end
-
-larger_container_type(::Type{T}, ::Type{T}) where T = T
-larger_container_type(::Type{Base.Bottom}, ::Type{T}) where T = T
-larger_container_type(::Type{T}, ::Type{Base.Bottom}) where T = T
-larger_container_type(::Type{Base.Bottom}, ::Type{Base.Bottom}) = Base.Bottom
-function larger_container_type(::Type{S}, ::Type{T}) where {S,T}
-    larger_container_type(larger_container_rule(S, T), larger_container_rule(T, S))
-end
-
-larger_container_rule(::Type{<:Any}, ::Type{<:Any}) = Base.Bottom
-function larger_container_rule(::Type{X}, ::Type{Y}) where {A, f, X<:Normed{A, f},
-                                                            B, g, Y<:Normed{B, g}}
-    if f < g
-        T = Y
-    elseif f == g
-        # Prefer smaller containers with the same bit depth
-        T = sizeof(A) < sizeof(B) ? X : Y
-    else
-        T = X
-    end
-    T
-end
-
-function max_container_depth(maxvals)
-    mapreduce(determine_demind_container_depth, larger_container_type,
-              maxvals, init = N0f8)
-end
-
 function feather_video_encode_demind_segments(input_fname, roi_x, roi_y,
                                               min_frames, subtracted_maxvals,
                                               exposed_ranges, framerate,
@@ -256,9 +344,10 @@ function feather_video_encode_demind_segments(input_fname, roi_x, roi_y,
     base_name = basename(input_fname)
     video_names = joinpath(writedir, def_fname_f.(base_name, exposed_ranges))
 
-    outs = frame_iter_preamble(input_fname, roi_x, roi_y)
+    outs = frame_iter_preamble(input_fname)
     outs === nothing && return String[]
-    inputvid, img_raw, roi_xr, roi_yr = outs
+    inputvid, img_raw = outs
+    roi_xr, roi_yr = check_slices(img_raw, roi_x, roi_y)
     graytype = max_container_depth(subtracted_maxvals)
     graybuf = similar(img_raw, graytype, length.((roi_xr, roi_yr)))
 
@@ -417,6 +506,326 @@ function feather_video_read_demin_audio(videof::AbstractString, thr::Real,
     syncf_ndx === nothing && throw(error("Could not find sync file for $videof"))
     syncpath = joinpath(searchdir, dirlisting[syncf_ndx])
     feather_video_read_demin_audio(videof, syncpath, thr, args...; kwargs...)
+end
+
+exposure_map_grow!(grow_exposure_f::F, priv_data, img_buff) where F =
+    grow_exposure_f(priv_data..., pop!(img_buff))
+
+function exposure_map_drain!(grow_exposure_f::F, img_buff, priv_data) where F
+    while !isempty(img_buff)
+        priv_data = exposure_map_grow!(grow_exposure_f, priv_data, img_buff)
+    end
+    priv_data
+end
+
+function exposure_map_terminate!(end_exposure_f::F, priv_data, exposure_outs,
+                                 exposed_ranges, img_buff, this_exposure_range) where F
+    res = end_exposure_f(this_exposure_range, priv_data...)
+    if exposure_outs === nothing
+        exposure_outs = [res]
+    else
+        push!(exposure_outs, res)
+    end
+    push!(exposed_ranges, this_exposure_range)
+    empty!(img_buff)
+    exposure_outs
+end
+
+function exposure_map_loop_body!(new_exposure_f::F, grow_exposure_f::G, end_exposure_f::H, nexposed,
+                                 in_steady_state, img_exposed, exposure_start, img_buff,
+                                 priv_data, exposure_outs, exposed_ranges,
+                                 img_cropped, shutter_delay, avg_norm, thr,
+                                 frameno) where {F, G, H}
+
+    frame_above_thr = frame_avg_intensity(img_cropped, avg_norm) >= thr
+    nexposed = ifelse(frame_above_thr, nexposed + 1, 0)
+    img_exposed = nexposed > shutter_delay
+    if img_exposed
+        steady_state = nexposed > 2 * shutter_delay
+        if steady_state
+            if !in_steady_state
+                priv_data = new_exposure_f(img_cropped, priv_data...)
+                exposure_start = frameno - shutter_delay
+            end
+            priv_data = exposure_map_grow!(grow_exposure_f, priv_data, img_buff)
+            in_steady_state = true
+        end
+        isfull(img_buff) && error("circular buffer overflow")
+        push!(img_buff, img_cropped)
+    else # img not exposed
+        if in_steady_state
+            this_exposure_range = exposure_start : frameno - shutter_delay - 1
+            exposure_outs = exposure_map_terminate!(end_exposure_f, priv_data,
+                                    exposure_outs, exposed_ranges, img_buff,
+                                    this_exposure_range)
+            in_steady_state = false
+        end
+    end
+    return nexposed, in_steady_state, img_exposed, exposure_start, priv_data, exposure_outs
+end
+
+function exposure_map!(new_exposure_f::F, grow_exposure_f::G, end_exposure_f::H,
+                       thr, img_stack, priv_data = ();
+                       shutter_delay = 1,
+                       roi_x::Union{Colon, <:UnitRange} = :,
+                       roi_y::Union{Colon, <:UnitRange} = :) where {F, G, H}
+    first_img, rest_imgs = peel(img_stack)
+    roi_xr, roi_yr = check_slices(first_img, roi_x, roi_y)
+    avg_norm = get_norm(roi_xr, roi_yr)
+    img_cropped = view(first_img, roi_xr, roi_yr)
+    img_buff = CircularBuffer{typeof(img_cropped)}(shutter_delay)
+    nexposed = 0
+    in_steady_state = false
+    img_exposed = false
+    exposure_start = -1
+    curr_frameno = 1
+    exposure_outs = nothing
+    exposed_ranges = Vector{UnitRange{Int}}()
+    nexposed, in_steady_state, img_exposed, exposure_start, priv_data, exposure_outs =
+        exposure_map_loop_body!(new_exposure_f, grow_exposure_f, end_exposure_f,
+                                nexposed, in_steady_state, img_exposed,
+                                exposure_start, img_buff, priv_data,
+                                exposure_outs, exposed_ranges, img_cropped,
+                                shutter_delay, avg_norm, thr, curr_frameno)
+    for img in rest_imgs
+        curr_frameno += 1
+        img_cropped = view(img, roi_xr, roi_yr)
+        nexposed, in_steady_state, img_exposed, exposure_start, priv_data, exposure_outs =
+            exposure_map_loop_body!(new_exposure_f, grow_exposure_f,
+                                    end_exposure_f, nexposed, in_steady_state,
+                                    img_exposed, exposure_start, img_buff,
+                                    priv_data, exposure_outs, exposed_ranges,
+                                    img_cropped, shutter_delay, avg_norm, thr,
+                                    curr_frameno)
+    end
+    if img_exposed
+        priv_data = exposure_map_drain!(grow_exposure_f, img_buff, priv_data)
+        this_exposure_range = exposure_start : curr_frameno
+        exposure_outs = exposure_map_terminate!(end_exposure_f, priv_data,
+                                exposure_outs, exposed_ranges, img_buff,
+                                this_exposure_range)
+    end
+    exposure_outs, exposed_ranges
+end
+
+function frames_min_max_accum_new_exp!(::Type{S}, img::AbstractArray{T};
+                                       nt = nthreads()) where {S,T}
+    nr, nc = size(img)
+    rowrange = 1:nr
+    if nt > 1
+        blksize = cld(nc, nt)
+        colranges = Vector{UnitRange{Int}}(undef, nt)
+        @inbounds for tno in 1:nt
+            lo = (tno - 1) * blksize + 1
+            hi = min(tno * blksize, nc)
+            colranges[tno] = lo:hi
+        end
+        tasks = Vector{Task}(undef, nt)
+    else
+        colranges = [1:nc]
+        tasks = Vector{Task}()
+    end
+    minf, maxf, accf = frames_min_max_accum_alloc(S, T, size(img))
+    frames_min_max_accum_init!(minf, maxf, accf)
+    minf, maxf, accf, tasks, rowrange, colranges
+end
+
+function frames_min_max_accum_new_exp!(::DataType, ::AbstractArray, minf, maxf,
+                                       accf, args...; kwargs...)
+    frames_min_max_accum_init!(minf, maxf, accf)
+    minf, maxf, accf, args...
+end
+
+function frames_min_max_accum_grow_exp!(minf, maxf, accf, tasks, rowrange,
+                                        colranges, img)
+    frame_min_max_accum!(minf, maxf, accf, tasks, img, rowrange, colranges)
+    minf, maxf, accf, tasks, rowrange, colranges
+end
+
+function frames_min_max_accum_end_exp!(::Type{T}, exposed_range, minf, maxf,
+                                       accf, args...; use_gamma = false) where T
+    meanf = similar(accf, T)
+    meanf .= accf ./ length(exposed_range)
+    demeaned_minv = typemax(T)
+    demeaned_maxv = typemin(T)
+    @inbounds for i in eachindex(minf)
+        meanv = meanf[i]
+        demeaned_minv = min(demeaned_minv, minf[i] - meanv)
+        demeaned_maxv = max(demeaned_maxv, maxf[i] - meanv)
+    end
+    outT = determine_container_depth(demeaned_maxv - demeaned_minv)
+    maxscale = reinterpret(one(outT))
+    f = make_scale_f(rawtype(outT), demeaned_minv, demeaned_maxv, maxscale, use_gamma)
+    return outT, f, meanf
+end
+
+function feather_video_read_demean_write(videof, thr, framerate, outdir
+                                                 = pwd();
+                                                 scratchdir = tempdir(),
+                                                 nt = nthreads(),
+                                                 use_gamma = false,
+                                                 roi_x::Union{Colon, <:UnitRange} = :,
+                                                 roi_y::Union{Colon, <:UnitRange} = :,
+                                                 shutter_delay = 1,
+                                                 kwargs...)
+    imgs = reinterpret(UInt16,
+                       convert_feather_video_frames(videof, parentdir = scratchdir))
+    img_stack = [view(imgs, :, :, i) for i in 1:size(imgs, 3)]
+    new_exposure_f = (img, args...) -> frames_min_max_accum_new_exp!(UInt32,
+                                                                     img,
+                                                                     args...)
+    end_exposure_f = (args...) -> frames_min_max_accum_end_exp!(Float32,
+                                                                args...;
+                                                                use_gamma = false)
+    outs, exposed_ranges = exposure_map!(new_exposure_f,
+                                         frames_min_max_accum_grow_exp!,
+                                         end_exposure_f, thr, img_stack;
+                                         roi_x = roi_x, roi_y = roi_y,
+                                         shutter_delay)
+    for ((outT, f, meanf), exposed_range) in zip(outs, exposed_ranges)
+        img_block = [view(imgs, roi_x, roi_y, j) for j in exposed_range]
+        new_vid_path = joinpath(outdir,
+                                demeaned_video_name(videof, exposed_range))
+        write_demeaned_video(f, new_vid_path, img_block, meanf, framerate; kwargs...)
+    end
+end
+
+function demeaned_video_name(fname, exposed_range)
+    bn, ext = splitext(basename(fname))
+    "$(bn)_$(exposed_range[1])-$(exposed_range[2]).mp4"
+end
+
+function write_demeaned_video(f, fpath, img_stack, meanf, framerate; kwargs...)
+    first_img = first(img_stack)
+    outT = typeof(f(first(first_img)))
+    framebuff = similar(first_img, outT)
+    writer = open_video_out!(fpath, framebuff; framerate, scanline_major = true,
+                             kwargs...)
+    try
+        for i in eachindex(img_stack)
+            this_img = img_stack[i]
+            for j in eachindex(img_stack[i])
+                framebuff[j] = f(this_img[j] - meanf[j])
+            end
+            append_encode_mux!(writer, framebuff, i - 1)
+        end
+    catch
+        isfile(fpath) && rm(fpath, force = true)
+        rethrow()
+    finally
+        close_video_out!(writer)
+    end
+    nothing
+end
+
+function streaming_intensities(fname, roi_x = :, roi_y = :; nt = nthreads())
+    outs = frame_iter_preamble(fname)
+    outs === nothing && return Float64[]
+    r, img_raw = outs
+    roi_xr, roi_yr = check_slices(img_raw, roi_x, roi_y)
+    norm = get_norm(roi_xr, roi_yr)
+
+    nframes = get_number_frames(fname)
+    if nframes === nothing
+        error("Could not find the number of frames from video container $fname")
+    end
+
+    intensities = Vector{Float64}(undef, nframes)
+    fno = 1
+    @inbounds intensities[fno] = frame_avg_intensity(convert_featherscope_rgb,
+                                                     img_raw, roi_xr, roi_yr,
+                                                     norm, nt)
+    while !eof(r) && fno < nframes
+        read!(r, img_raw)
+        fno += 1
+        @inbounds intensities[fno] = frame_avg_intensity(convert_featherscope_rgb,
+                                                         img_raw, roi_xr,
+                                                         roi_yr, norm, nt)
+    end
+    fno < nframes && resize!(intensities, fno)
+    return intensities
+end
+
+function update_exposure_first_frame(ignore_exposure, intensity, thr)
+    above_thr = intensity >= thr
+    # if intensity falls below thr, ignore_exposure should stay false
+    ignore_exposure &= above_thr
+    is_exposed = !ignore_exposure & above_thr
+    ignore_exposure, is_exposed
+end
+
+"""
+    find_first_exposed_frame(fname, thr, roi_x = :, roi_y = : ;
+                             nt = nthreads(), shutter_delay = 1,
+                             skip_exposure_at_start = true) -> Union{Int, Nothing}
+
+Find the average intensity in the roi of successive frames of `fname`, and
+return the frame number where the intensity is greater than or equal to `thr`.
+If `fname` is empty, or if all frames have an average intensity in the roi less
+than `thr`, then return `nothing`.
+"""
+function find_first_exposed_frame(fname, thr, roi_x = :, roi_y = : ;
+                                  nt = nthreads(), shutter_delay = 1,
+                                  skip_exposure_at_start = true)
+    outs = frame_iter_preamble(fname)
+    outs === nothing && return nothing
+    r, img_raw = outs
+    roi_xr, roi_yr = check_slices(img_raw, roi_x, roi_y)
+    norm = get_norm(roi_xr, roi_yr)
+
+    fno = 1
+    intensity = frame_avg_intensity(convert_featherscope_rgb,
+                                    img_raw, roi_xr, roi_yr, norm, nt)
+    ignore_exposure, is_exposed = update_exposure_first_frame(skip_exposure_at_start,
+                                                              intensity, thr)
+    nexposed = ifelse(is_exposed, 1, 0)
+    while !eof(r) & (nexposed <= shutter_delay)
+        fno += 1
+        read!(r, img_raw)
+        intensity = frame_avg_intensity(convert_featherscope_rgb, img_raw,
+                                        roi_xr, roi_yr, norm, nt)
+        ignore_exposure, is_exposed = update_exposure_first_frame(ignore_exposure,
+                                                                  intensity, thr)
+        nexposed = ifelse(is_exposed, nexposed + 1, 0)
+    end
+    return eof(r) ? nothing : fno
+end
+
+function find_exposed_frame_ranges(fname, thr, roi_x = :, roi_y = : ;
+                                   nt = nthreads(), shutter_delay = 1,
+                                   skip_exposure_at_start = true)
+    out = Vector{UnitRange{Int}}()
+    frame_info = frame_iter_preamble(fname)
+    frame_info === nothing && return out
+    r, img_raw = frame_info
+    roi_xr, roi_yr = check_slices(img_raw, roi_x, roi_y)
+    norm = get_norm(roi_xr, roi_yr)
+
+    fno = 1
+    intensity = frame_avg_intensity(convert_featherscope_rgb, img_raw, roi_xr,
+                                    roi_yr, norm, nt)
+    ignore_exposure, is_exposed = update_exposure_first_frame(skip_exposure_at_start,
+                                                              intensity, thr)
+    nexposed = ifelse(is_exposed, 1, 0)
+    while !eof(r)
+        fno += 1
+        read!(r, img_raw)
+        intensity = frame_avg_intensity(convert_featherscope_rgb, img_raw,
+                                        roi_xr, roi_yr, norm, nt)
+        ignore_exposure, is_exposed = update_exposure_first_frame(ignore_exposure,
+                                                                  intensity, thr)
+        if !is_exposed & (nexposed > shutter_delay) # Leaving exposure
+            last_exposed = fno - 1
+            push!(out, last_exposed - nexposed + shutter_delay + 1:
+                  last_exposed - shutter_delay)
+        end
+        nexposed = ifelse(is_exposed, nexposed + 1, 0)
+    end
+    if nexposed > shutter_delay # Unfinished exposure
+        # Do not account for the delay in the shutter closing at the end of file
+        push!(out, fno - nexposed + shutter_delay + 1: fno)
+    end
+    out
 end
 
 end # module
