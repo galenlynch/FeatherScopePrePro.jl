@@ -686,7 +686,8 @@ function feather_video_read_demean_write(videof, thr, framerate, outdir
         img_block = [view(imgs, roi_x, roi_y, j) for j in exposed_range]
         new_vid_path = joinpath(outdir,
                                 demeaned_video_name(videof, exposed_range))
-        write_demeaned_video(f, new_vid_path, img_block, meanf, framerate; kwargs...)
+        write_demeaned_video(f, rawtype(outT), new_vid_path, img_block, meanf,
+                             framerate; kwargs...)
     end
 end
 
@@ -695,10 +696,9 @@ function demeaned_video_name(fname, exposed_range)
     "$(bn)_$(exposed_range[1])-$(exposed_range[2]).mp4"
 end
 
-function write_demeaned_video(f, fpath, img_stack, meanf, framerate; kwargs...)
+function write_demeaned_video(f, ::Type{T}, fpath, img_stack, meanf, framerate; kwargs...) where T
     first_img = first(img_stack)
-    outT = typeof(f(first(first_img)))
-    framebuff = similar(first_img, outT)
+    framebuff = similar(first_img, T)
     writer = open_video_out!(fpath, framebuff; framerate, scanline_major = true,
                              kwargs...)
     try
