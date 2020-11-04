@@ -3,7 +3,8 @@ module FeatherScopePrePro
 using CaProcessing: clip_segments_thr, clip_imgs, demin, map_to_8bit, PixelLUT,
     pixel_lut, rescale_compress, max_container_depth, frame_avg_intensity,
     get_norm, frames_min_max_accum_alloc, frames_min_max_accum_init!,
-    frame_min_max_accum!, determine_container_depth, make_scale_f
+    frame_min_max_accum!, determine_container_depth, make_scale_f,
+    make_pixel_lut, apply_lut!
 using GLUtilities: ndx_to_t, t_to_ndx, clip_ndx
 using ColorTypes: Gray, RGB
 using DataStructures: OrderedDict, CircularBuffer, isfull
@@ -155,16 +156,16 @@ function feather_video_min_frame_planning(input_fname, thr, roi_x = :,
 end
 
 function avis_to_tiff_demin(savedir, fnames, x, y, thr;
-                      scratch = tempdir(), nt = nthreads())
+                      scratch_dir = tempdir(), nt = nthreads())
     for fname in fnames
-        avi_to_tiff_demin(savedir, fname, x, y, thr, scratch = scratch)
+        avi_to_tiff_demin(savedir, fname, x, y, thr, scratch_dir = scratch_dir)
     end
 end
 
 function avi_to_tiff_demin(savedir::AbstractString, fname::AbstractString,
                            x::AbstractRange, y::AbstractRange, thr::Real;
-                           scratch = tempdir(), kwargs...)
-    imgs = convert_feather_video_frames(fname, parentdir = scratch)
+                           scratch_dir = tempdir(), kwargs...)
+    imgs = convert_feather_video_frames(fname, scratch_dir = scratch_dir)
     avi_to_tiff_demin(savedir, imgs, fname, x, y, thr; kwargs...)
 end
 
@@ -233,9 +234,9 @@ function avi_to_tiff_demin(savedir::AbstractString, imgs::AbstractArray,
     end
 end
 
-function  avi_to_tiff_raw(savedir, fname; scratch = tempdir())
+function  avi_to_tiff_raw(savedir, fname; scratch_dir = tempdir())
     pref = extract_avi_prefix(fname)
-    imgs = convert_feather_video_frames(fname, parentdir = scratch)
+    imgs = convert_feather_video_frames(fname, scratch_dir = scratch_dir)
     out_fname = joinpath(savedir, pref * ".tiff")
     save(out_fname, colorview(Gray, PermutedDimsArray(imgs, (2, 1, 3))))
 end
@@ -564,6 +565,9 @@ function exposure_map_loop_body!(new_exposure_f::F, grow_exposure_f::G, end_expo
     return nexposed, in_steady_state, img_exposed, exposure_start, priv_data, exposure_outs
 end
 
+"""
+img_stack should not be normalized, nor should thr
+"""
 function exposure_map!(new_exposure_f::F, grow_exposure_f::G, end_exposure_f::H,
                        thr, img_stack, priv_data = ();
                        shutter_delay = 1,
@@ -661,7 +665,7 @@ end
 
 function feather_video_read_demean_write(videof, thr, framerate, outdir
                                                  = pwd();
-                                                 scratchdir = tempdir(),
+                                                 scratch_dir = tempdir(),
                                                  nt = nthreads(),
                                                  use_gamma = false,
                                                  roi_x::Union{Colon, <:UnitRange} = :,
@@ -669,7 +673,7 @@ function feather_video_read_demean_write(videof, thr, framerate, outdir
                                                  shutter_delay = 1,
                                                  kwargs...)
     imgs = reinterpret(UInt16,
-                       convert_feather_video_frames(videof, parentdir = scratchdir))
+                       convert_feather_video_frames(videof, scratch_dir = scratch_dir))
     img_stack = [view(imgs, :, :, i) for i in 1:size(imgs, 3)]
     new_exposure_f = (img, args...) -> frames_min_max_accum_new_exp!(UInt32,
                                                                      img,
@@ -677,9 +681,10 @@ function feather_video_read_demean_write(videof, thr, framerate, outdir
     end_exposure_f = (args...) -> frames_min_max_accum_end_exp!(Float32,
                                                                 args...;
                                                                 use_gamma = false)
+    thr_scaled = thr * reinterpret(one(N6f10))
     outs, exposed_ranges = exposure_map!(new_exposure_f,
                                          frames_min_max_accum_grow_exp!,
-                                         end_exposure_f, thr, img_stack;
+                                         end_exposure_f, thr_scaled, img_stack;
                                          roi_x = roi_x, roi_y = roi_y,
                                          shutter_delay)
     for ((outT, f, meanf), exposed_range) in zip(outs, exposed_ranges)
@@ -691,9 +696,9 @@ function feather_video_read_demean_write(videof, thr, framerate, outdir
     end
 end
 
-function demeaned_video_name(fname, exposed_range)
+function demeaned_video_name(fname, exposed_range::AbstractUnitRange)
     bn, ext = splitext(basename(fname))
-    "$(bn)_$(exposed_range[1])-$(exposed_range[2]).mp4"
+    "$(bn)_$(first(exposed_range))-$(last(exposed_range)).mp4"
 end
 
 function write_demeaned_video(f, ::Type{T}, fpath, img_stack, meanf, framerate; kwargs...) where T
@@ -733,14 +738,14 @@ function streaming_intensities(fname, roi_x = :, roi_y = :; nt = nthreads())
     intensities = Vector{Float64}(undef, nframes)
     fno = 1
     @inbounds intensities[fno] = frame_avg_intensity(convert_featherscope_rgb,
-                                                     img_raw, roi_xr, roi_yr,
-                                                     norm, nt)
+                                                     UInt64, img_raw, norm;
+                                                     roi_xr, roi_yr, nt)
     while !eof(r) && fno < nframes
         read!(r, img_raw)
         fno += 1
         @inbounds intensities[fno] = frame_avg_intensity(convert_featherscope_rgb,
-                                                         img_raw, roi_xr,
-                                                         roi_yr, norm, nt)
+                                                         UInt64, img_raw, norm;
+                                                         roi_xr, roi_yr, nt)
     end
     fno < nframes && resize!(intensities, fno)
     return intensities
@@ -775,15 +780,15 @@ function find_first_exposed_frame(fname, thr, roi_x = :, roi_y = : ;
 
     fno = 1
     intensity = frame_avg_intensity(convert_featherscope_rgb,
-                                    img_raw, roi_xr, roi_yr, norm, nt)
+                                    UInt64, img_raw, norm; roi_xr, roi_yr, nt)
     ignore_exposure, is_exposed = update_exposure_first_frame(skip_exposure_at_start,
                                                               intensity, thr)
     nexposed = ifelse(is_exposed, 1, 0)
     while !eof(r) & (nexposed <= shutter_delay)
         fno += 1
         read!(r, img_raw)
-        intensity = frame_avg_intensity(convert_featherscope_rgb, img_raw,
-                                        roi_xr, roi_yr, norm, nt)
+        intensity = frame_avg_intensity(convert_featherscope_rgb, UInt64,
+                                        img_raw, norm; roi_xr, roi_yr, nt)
         ignore_exposure, is_exposed = update_exposure_first_frame(ignore_exposure,
                                                                   intensity, thr)
         nexposed = ifelse(is_exposed, nexposed + 1, 0)
@@ -802,16 +807,16 @@ function find_exposed_frame_ranges(fname, thr, roi_x = :, roi_y = : ;
     norm = get_norm(roi_xr, roi_yr)
 
     fno = 1
-    intensity = frame_avg_intensity(convert_featherscope_rgb, img_raw, roi_xr,
-                                    roi_yr, norm, nt)
+    intensity = frame_avg_intensity(convert_featherscope_rgb, UInt64, img_raw,
+                                    norm; roi_xr, roi_yr, nt)
     ignore_exposure, is_exposed = update_exposure_first_frame(skip_exposure_at_start,
                                                               intensity, thr)
     nexposed = ifelse(is_exposed, 1, 0)
     while !eof(r)
         fno += 1
         read!(r, img_raw)
-        intensity = frame_avg_intensity(convert_featherscope_rgb, img_raw,
-                                        roi_xr, roi_yr, norm, nt)
+        intensity = frame_avg_intensity(convert_featherscope_rgb, UInt64,
+                                        img_raw, norm; roi_xr, roi_yr, nt)
         ignore_exposure, is_exposed = update_exposure_first_frame(ignore_exposure,
                                                                   intensity, thr)
         if !is_exposed & (nexposed > shutter_delay) # Leaving exposure
@@ -826,6 +831,25 @@ function find_exposed_frame_ranges(fname, thr, roi_x = :, roi_y = : ;
         push!(out, fno - nexposed + shutter_delay + 1: fno)
     end
     out
+end
+
+function avi_to_scaled_gray_video(in_filename, out_filename, framerate;
+                                  scratch_dir = "", nt = nthreads(), use_gamma =
+                                  false, kwargs...)
+    imgs = convert_feather_video_frames(in_filename; scratch_dir)
+    nx, ny, nf = size(imgs)
+    minv, maxv = extrema(imgs)
+    l = make_pixel_lut(minv, maxv, one(N6f10), use_gamma)
+    framebuff = Matrix{N6f10}(undef, nx, ny)
+    imgbuff = PermutedDimsArray(framebuff, (2, 1))
+    writer = open_video_out!(out_filename, framebuff; framerate,
+                             scanline_major = false, kwargs...)
+    for i in 1:nf
+        apply_lut!(l, framebuff, view(imgs, :, :, i); nt)
+        append_encode_mux!(writer, imgbuff, i - 1)
+    end
+    close_video_out!(writer)
+    nothing
 end
 
 end # module
