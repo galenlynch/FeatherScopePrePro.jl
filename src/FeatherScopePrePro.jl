@@ -841,12 +841,11 @@ function avi_to_scaled_gray_video(in_filename, out_filename, framerate;
     minv, maxv = extrema(imgs)
     l = make_pixel_lut(minv, maxv, one(N6f10), use_gamma)
     framebuff = Matrix{N6f10}(undef, nx, ny)
-    imgbuff = PermutedDimsArray(framebuff, (2, 1))
     writer = open_video_out!(out_filename, framebuff; framerate,
-                             scanline_major = false, kwargs...)
+                             scanline_major = true, kwargs...)
     for i in 1:nf
         apply_lut!(l, framebuff, view(imgs, :, :, i); nt)
-        append_encode_mux!(writer, imgbuff, i - 1)
+        append_encode_mux!(writer, framebuff, i - 1)
     end
     close_video_out!(writer)
     nothing
