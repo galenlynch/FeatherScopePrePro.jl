@@ -30,7 +30,8 @@ import VideoIO
 
 import FFMPEG
 
-export avis_to_tiff_demin,
+export avi_to_scaled_gray_video,
+    avis_to_tiff_demin,
     avi_to_tiff_demin,
     avi_to_tiff_raw,
     find_exposed_frame_ranges,
