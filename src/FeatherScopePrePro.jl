@@ -156,20 +156,6 @@ function feather_video_min_frame_planning(input_fname, thr, roi_x = :,
     return min_frames, subtracted_maxvals, exposed_ranges, fno
 end
 
-function avis_to_tiff_demin(savedir, fnames, x, y, thr;
-                      scratch_dir = tempdir(), nt = nthreads())
-    for fname in fnames
-        avi_to_tiff_demin(savedir, fname, x, y, thr, scratch_dir = scratch_dir)
-    end
-end
-
-function avi_to_tiff_demin(savedir::AbstractString, fname::AbstractString,
-                           x::AbstractRange, y::AbstractRange, thr::Real;
-                           scratch_dir = tempdir(), kwargs...)
-    imgs = convert_feather_video_frames(fname, scratch_dir = scratch_dir)
-    avi_to_tiff_demin(savedir, imgs, fname, x, y, thr; kwargs...)
-end
-
 function avi_to_tiff_demin(savedir::AbstractString, imgs::AbstractArray,
                            fname::AbstractString, x::AbstractRange,
                            y::AbstractRange, thr::Real;
@@ -232,6 +218,20 @@ function avi_to_tiff_demin(savedir::AbstractString, imgs::AbstractArray,
     # save metadata
     open(json_fname, "w") do io
         print(io, json(json_dict))
+    end
+end
+
+function avi_to_tiff_demin(savedir::AbstractString, fname::AbstractString,
+                           x::AbstractRange, y::AbstractRange, thr::Real;
+                           scratch_dir = tempdir(), kwargs...)
+    imgs = convert_feather_video_frames(fname, scratch_dir = scratch_dir)
+    avi_to_tiff_demin(savedir, imgs, fname, x, y, thr; kwargs...)
+end
+
+function avis_to_tiff_demin(savedir, fnames, x, y, thr; scratch_dir = tempdir(),
+                            nt = nthreads(), force = false)
+    for fname in fnames
+        avi_to_tiff_demin(savedir, fname, x, y, thr; scratch_dir, force)
     end
 end
 
