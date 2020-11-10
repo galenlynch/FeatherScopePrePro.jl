@@ -162,8 +162,22 @@ function feather_video_min_frame_planning(input_fname, thr, roi_x = :,
     return min_frames, subtracted_maxvals, exposed_ranges, fno
 end
 
+function avis_to_tiff_demin(savedir, fnames, x, y, thr;
+                      scratch_dir = tempdir(), nt = nthreads())
+    for fname in fnames
+        avi_to_tiff_demin(savedir, fname, x, y, thr, scratch_dir = scratch_dir)
+    end
+end
+
+function avi_to_tiff_demin(savedir::AbstractString, in_filename::AbstractString,
+                           x::AbstractRange, y::AbstractRange, thr::Real;
+                           scratch_dir = tempdir(), kwargs...)
+    imgs = convert_feather_video_frames(in_filename, scratch_dir = scratch_dir)
+    avi_to_tiff_demin(savedir, imgs, in_filename, x, y, thr; kwargs...)
+end
+
 function avi_to_tiff_demin(savedir::AbstractString, imgs::AbstractArray,
-                           fname::AbstractString, x::AbstractRange,
+                           in_filename::AbstractString, x::AbstractRange,
                            y::AbstractRange, thr::Real;
                            nt = nthreads(),
                            name_f = default_name_conversion)
@@ -177,12 +191,12 @@ function avi_to_tiff_demin(savedir::AbstractString, imgs::AbstractArray,
     nkeep = length(keep_idxs)
 
     # build metadata json
-    pref = extract_avi_prefix(fname)
+    pref = extract_avi_prefix(in_filename)
     json_fname = joinpath(savedir, pref * ".json")
 
     json_dict = JSON_DICT_TYPE()
     json_dict["working_dir"] = pwd()
-    json_dict["input_avi"] = fname
+    json_dict["input_avi"] = in_filename
     json_dict["threshold"] = thr
 
     xb, xe = x_to_bounds(imgs, x)
@@ -227,23 +241,9 @@ function avi_to_tiff_demin(savedir::AbstractString, imgs::AbstractArray,
     end
 end
 
-function avi_to_tiff_demin(savedir::AbstractString, fname::AbstractString,
-                           x::AbstractRange, y::AbstractRange, thr::Real;
-                           scratch_dir = tempdir(), kwargs...)
-    imgs = convert_feather_video_frames(fname, scratch_dir = scratch_dir)
-    avi_to_tiff_demin(savedir, imgs, fname, x, y, thr; kwargs...)
-end
-
-function avis_to_tiff_demin(savedir, fnames, x, y, thr; scratch_dir = tempdir(),
-                            nt = nthreads(), force = false)
-    for fname in fnames
-        avi_to_tiff_demin(savedir, fname, x, y, thr; scratch_dir, force)
-    end
-end
-
-function  avi_to_tiff_raw(savedir, fname; scratch_dir = tempdir())
-    pref = extract_avi_prefix(fname)
-    imgs = convert_feather_video_frames(fname, scratch_dir = scratch_dir)
+function  avi_to_tiff_raw(savedir, in_filename; scratch_dir = tempdir())
+    pref = extract_avi_prefix(in_filename)
+    imgs = convert_feather_video_frames(in_filename, scratch_dir = scratch_dir)
     out_fname = joinpath(savedir, pref * ".tiff")
     save(out_fname, colorview(Gray, PermutedDimsArray(imgs, (2, 1, 3))))
 end
