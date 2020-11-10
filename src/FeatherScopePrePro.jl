@@ -43,6 +43,12 @@ export avi_to_scaled_gray_video,
 const AVI_REGEX = r"(?<file_prefix>.*)\.avi$"i
 const JSON_DICT_TYPE = OrderedDict{String, Any}
 
+function force_file_check(filename, force)
+    if !force && isfile(filename)
+        error("File $filename already exists, set force = true to overwrite")
+    end
+end
+
 function finish_exposure!(min_frames, subtracted_maxvals, exposed_ranges,
                           roi_max, roi_min, exposure_start, exposure_stop, nt)
     subtr_mv = maxval_min_max_frames(roi_min, roi_max, nt)
@@ -275,10 +281,11 @@ struct FrameEncoderState{T}
     writer::VideoWriter
 end
 
-function start_encode(new_fname, graybuf, framerate, encoder_settings,
-                      encoder_private_settings)
+function start_encode(out_filename, graybuf, framerate, encoder_settings,
+                      encoder_private_settings, force)
     writebuf = PermutedDimsArray(graybuf, (2,1))
-    writer = open_video_out!(new_fname, writebuf; framerate, encoder_settings,
+    force_file_check(out_filename, force)
+    writer = open_video_out!(out_filename, writebuf; framerate, encoder_settings,
                              encoder_private_settings)
     return io, s_fpath, encoder
 end
@@ -292,14 +299,14 @@ finish_encode(encoder_state) = close_video_out!(encoder_state.writer)
 
 function append_demind_video_frame!(encoder_state, exposure_no, graybuf, img_raw,
                                     exposed_range, min_frame, sub_maxv, fno,
-                                    roi_xr, roi_yr, new_fname, framerate,
+                                    roi_xr, roi_yr, out_filename, framerate,
                                     use_gamma_compression, encoder_settings,
-                                    encoder_private_settings)
+                                    encoder_private_settings, force)
     if encoder_state === nothing
         if fno in exposed_range
-            io, s_fpath, encoder = start_encode(new_fname, graybuf, framerate,
+            io, s_fpath, encoder = start_encode(out_filename, graybuf, framerate,
                                                 encoder_settings,
-                                                encoder_private_settings)
+                                                encoder_private_settings, force)
             maxv_scale = 1 / sub_maxv
             Tout = eltype(graybuf)
             if use_gamma_compression
@@ -403,7 +410,7 @@ function center_scale(a, max_dev = 1)
     centered .*= scale
 end
 
-function feather_sync_add_audio(syncf, new_fnames, exposed_ranges, sync_frameno,
+function feather_sync_add_audio(syncf, out_filenames, exposed_ranges, sync_frameno,
                                 framerate, writedir, shutter_offset, fs_sync,
                                 force_video, nexposed; audio_depth = 16, kwargs...)
     # Find sync edges
@@ -429,12 +436,12 @@ function feather_sync_add_audio(syncf, new_fnames, exposed_ranges, sync_frameno,
         wavwrite(scaled_audio, temp_audio_f, Fs = fs_sync, nbits = audio_depth,
                  compression = WAVE_FORMAT_PCM)
         try
-            mv(new_fnames[exposure_no], temp_video_f, force = force_video)
+            mv(out_filenames[exposure_no], temp_video_f, force = force_video)
             try
                 # join video and audio
                 FFMPEG.exe(`-y -i $(temp_video_f) -i $(temp_audio_f) -c:v copy
                             -c:a aac -map 0:v:0 -map 1:a:0
-                            $(new_fnames[exposure_no])`)
+                            $(out_filenames[exposure_no])`)
             finally
                 rm(temp_video_f)
             end
@@ -464,7 +471,7 @@ function feather_video_read_demin_audio(videof::AbstractString,
     first_exposure_nosync = first(exposed_ranges[1]) == 1
     first_exposure_nosync && nexposed == 1 && return String[]
 
-    new_fnames = feather_video_encode_demind_segments(videof, roi_x, roi_y,
+    out_filenames = feather_video_encode_demind_segments(videof, roi_x, roi_y,
                                                       min_frames,
                                                       subtracted_maxvals,
                                                       exposed_ranges, framerate,
@@ -476,12 +483,12 @@ function feather_video_read_demin_audio(videof::AbstractString,
     sync_exposed_frameno = first_exposure_nosync ? exposed_ranges[2][1] :
                                                    exposed_ranges[1][1]
     try
-        feather_sync_add_audio(syncf, new_fnames, exposed_ranges,
+        feather_sync_add_audio(syncf, out_filenames, exposed_ranges,
                                sync_exposed_frameno, framerate, writedir,
                                shutter_offset, fs_sync, force_video, nexposed;
                                kwargs...)
     catch
-        for f in new_fnames
+        for f in out_filenames
             isfile(f) && rm(f)
         end
         rethrow()
@@ -671,7 +678,7 @@ function feather_video_read_demean_write(videof, thr, framerate, outdir
                                                  use_gamma = false,
                                                  roi_x::Union{Colon, <:UnitRange} = :,
                                                  roi_y::Union{Colon, <:UnitRange} = :,
-                                                 shutter_delay = 1,
+                                                 shutter_delay = 1, force = false,
                                                  kwargs...)
     imgs = reinterpret(UInt16,
                        convert_feather_video_frames(videof, scratch_dir = scratch_dir))
@@ -693,7 +700,7 @@ function feather_video_read_demean_write(videof, thr, framerate, outdir
         new_vid_path = joinpath(outdir,
                                 demeaned_video_name(videof, exposed_range))
         write_demeaned_video(f, rawtype(outT), new_vid_path, img_block, meanf,
-                             framerate; kwargs...)
+                             framerate; force, kwargs...)
     end
 end
 
@@ -702,10 +709,12 @@ function demeaned_video_name(fname, exposed_range::AbstractUnitRange)
     "$(bn)_$(first(exposed_range))-$(last(exposed_range)).mp4"
 end
 
-function write_demeaned_video(f, ::Type{T}, fpath, img_stack, meanf, framerate; kwargs...) where T
+function write_demeaned_video(f, ::Type{T}, out_filename, img_stack, meanf,
+                              framerate; force = false, kwargs...) where T
+    force_file_check(out_filename, force)
     first_img = first(img_stack)
     framebuff = similar(first_img, T)
-    writer = open_video_out!(fpath, framebuff; framerate, scanline_major = true,
+    writer = open_video_out!(out_filename, framebuff; framerate, scanline_major = true,
                              kwargs...)
     try
         for i in eachindex(img_stack)
@@ -716,7 +725,7 @@ function write_demeaned_video(f, ::Type{T}, fpath, img_stack, meanf, framerate; 
             append_encode_mux!(writer, framebuff, i - 1)
         end
     catch
-        isfile(fpath) && rm(fpath, force = true)
+        isfile(out_filename) && rm(out_filename, force = true)
         rethrow()
     finally
         close_video_out!(writer)
@@ -834,9 +843,10 @@ function find_exposed_frame_ranges(fname, thr, roi_x = :, roi_y = : ;
     out
 end
 
-function avi_to_scaled_gray_video(in_filename, out_filename, framerate;
+function avi_to_scaled_gray_video(out_filename, in_filename, framerate;
                                   scratch_dir = "", nt = nthreads(), use_gamma =
-                                  false, kwargs...)
+                                  false, force = false, kwargs...)
+    force_file_check(out_filename, force)
     imgs = convert_feather_video_frames(in_filename; scratch_dir)
     nx, ny, nf = size(imgs)
     minv, maxv = extrema(imgs)
