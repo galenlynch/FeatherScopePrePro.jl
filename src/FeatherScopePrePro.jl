@@ -281,12 +281,14 @@ struct FrameEncoderState{T}
     writer::VideoWriter
 end
 
-function start_encode(out_filename, graybuf, framerate, encoder_settings,
+function start_encode(out_filename, graybuf, framerate, container_settings,
+                      container_private_settings, encoder_settings,
                       encoder_private_settings, force)
     writebuf = PermutedDimsArray(graybuf, (2,1))
     force_file_check(out_filename, force)
-    writer = open_video_out!(out_filename, writebuf; framerate, encoder_settings,
-                             encoder_private_settings)
+    writer = open_video_out!(out_filename, writebuf; framerate,
+                             container_settings, container_private_settings,
+                             encoder_settings, encoder_private_settings)
     return io, s_fpath, encoder
 end
 
@@ -300,11 +302,14 @@ finish_encode(encoder_state) = close_video_out!(encoder_state.writer)
 function append_demind_video_frame!(encoder_state, exposure_no, graybuf, img_raw,
                                     exposed_range, min_frame, sub_maxv, fno,
                                     roi_xr, roi_yr, out_filename, framerate,
-                                    use_gamma_compression, encoder_settings,
+                                    use_gamma_compression, container_settings,
+                                    container_private_settings, encoder_settings,
                                     encoder_private_settings, force)
     if encoder_state === nothing
         if fno in exposed_range
             io, s_fpath, encoder = start_encode(out_filename, graybuf, framerate,
+                                                container_settings,
+                                                container_private_settings,
                                                 encoder_settings,
                                                 encoder_private_settings, force)
             maxv_scale = 1 / sub_maxv
@@ -345,8 +350,12 @@ function feather_video_encode_demind_segments(input_fname, roi_x, roi_y,
                                               exposed_ranges, framerate,
                                               writedir = pwd();
                                               use_gamma_compression = true,
-                                              encoder_properties = (;),
-                                              encoder_private_properties = (;))
+                                              container_settings = (;),
+                                              container_private_settings =
+                                              (movflags = "+write_colr",),
+                                              encoder_settings = (color_range = 2,),
+                                              encoder_private_settings =
+                                              (crf = 20, preset = "medium"))
     nexposure = length(exposed_ranges)
     nexposure > 0 || return String[]
     isdir(writedir) || throw(ArgumentError("Cannot access write directory $writedir"))
@@ -368,6 +377,7 @@ function feather_video_encode_demind_segments(input_fname, roi_x, roi_y,
         exposed_ranges[exposure_no], min_frames[exposure_no],
         subtracted_maxvals[exposure_no], fno, roi_xr, roi_yr,
         video_names[exposure_no], framerate, use_gamma_compression,
+        container_settings, container_private_settings,
         encoder_settings, encoder_private_settings
     )
 
@@ -379,7 +389,9 @@ function feather_video_encode_demind_segments(input_fname, roi_x, roi_y,
             exposed_ranges[exposure_no], min_frames[exposure_no],
             subtracted_maxvals[exposure_no], fno, roi_xr, roi_yr,
             video_names[exposure_no], framerate,
-            use_gamma_compression, encoder_settings, encoder_private_settings
+            use_gamma_compression, container_settings,
+            container_private_settings,
+            encoder_settings, encoder_private_settings
         )
     end
 
@@ -392,16 +404,24 @@ function feather_video_encode_demind_segments(input_fname, roi_x, roi_y,
 end
 
 function feather_video_read_demin(input_fname, thr, roi_x, roi_y, framerate,
-                                  writedir = pwd(); encoder_options = (;),
-                                  encoder_private_options = (;),
+                                  writedir = pwd();
+                                  container_settings = (;),
+                                  container_private_settings =
+                                  (movflags = "+write_colr",),
+                                  encoder_settings = (color_range = 2,),
+                                  encoder_private_settings =
+                                  (crf = 20, preset = "medium"),
                                   use_gamma_compression = true)
     min_frames, subtracted_maxvals, exposed_ranges, nf =
         feather_video_min_frame_planning(input_fname, thr, roi_x, roi_y)
     feather_video_encode_demind_segments(input_fname, roi_x, roi_y, min_frames,
                                          subtracted_maxvals, exposed_ranges,
                                          framerate, writedir;
-                                         use_gamma_compression, encoder_options,
-                                         encoder_private_options)
+                                         use_gamma_compression,
+                                         container_settings,
+                                         container_private_settings,
+                                         encoder_settings,
+                                         encoder_private_settings)
 end
 
 function center_scale(a, max_dev = 1)
@@ -710,11 +730,17 @@ function demeaned_video_name(fname, exposed_range::AbstractUnitRange)
 end
 
 function write_demeaned_video(f, ::Type{T}, out_filename, img_stack, meanf,
-                              framerate; force = false, kwargs...) where T
+                              framerate; force = false,
+                              container_private_settings =
+                              (movflags = "+write_colr",),
+                              encoder_settings = (color_range = 2,),
+                              kwargs...) where T
     force_file_check(out_filename, force)
     first_img = first(img_stack)
     framebuff = similar(first_img, T)
-    writer = open_video_out!(out_filename, framebuff; framerate, scanline_major = true,
+    writer = open_video_out!(out_filename, framebuff;
+                             framerate, container_private_settings,
+                             encoder_settings, scanline_major = true,
                              kwargs...)
     try
         for i in eachindex(img_stack)
@@ -844,8 +870,13 @@ function find_exposed_frame_ranges(fname, thr, roi_x = :, roi_y = : ;
 end
 
 function avi_to_scaled_gray_video(out_filename, in_filename, framerate;
-                                  scratch_dir = "", nt = nthreads(), use_gamma =
-                                  false, force = false, kwargs...)
+                                  scratch_dir = "", nt = nthreads(),
+                                  use_gamma = false, force = false,
+                                  container_private_settings =
+                                  (movflags = "+write_colr",),
+                                  encoder_settings = (color_range = 2,),
+                                  kwargs...)
+    encoder_settings = (color_range = 2,),
     force_file_check(out_filename, force)
     imgs = convert_feather_video_frames(in_filename; scratch_dir)
     nx, ny, nf = size(imgs)
@@ -853,7 +884,8 @@ function avi_to_scaled_gray_video(out_filename, in_filename, framerate;
     l = make_pixel_lut(minv, maxv, one(N6f10), use_gamma)
     framebuff = Matrix{N6f10}(undef, nx, ny)
     writer = open_video_out!(out_filename, framebuff; framerate,
-                             scanline_major = true, kwargs...)
+                             scanline_major = true, container_private_settings,
+                             encoder_settings, kwargs...)
     for i in 1:nf
         apply_lut!(l, framebuff, view(imgs, :, :, i); nt)
         append_encode_mux!(writer, framebuff, i - 1)
