@@ -24,7 +24,7 @@ using Base.Iterators: peel
 
 using Statistics: mean
 
-using VideoIO: open_video_out!, VideoWriter, openvideo, append_encode_mux!,
+using VideoIO: open_video_out, VideoWriter, openvideo, append_encode_mux!,
     close_video_out!
 import VideoIO
 
@@ -286,7 +286,7 @@ function start_encode(out_filename, graybuf, framerate, container_settings,
                       encoder_private_settings, force)
     writebuf = PermutedDimsArray(graybuf, (2,1))
     force_file_check(out_filename, force)
-    writer = open_video_out!(out_filename, writebuf; framerate,
+    writer = open_video_out(out_filename, writebuf; framerate,
                              container_settings, container_private_settings,
                              encoder_settings, encoder_private_settings)
     return io, s_fpath, encoder
@@ -738,7 +738,7 @@ function write_demeaned_video(f, ::Type{T}, out_filename, img_stack, meanf,
     force_file_check(out_filename, force)
     first_img = first(img_stack)
     framebuff = similar(first_img, T)
-    writer = open_video_out!(out_filename, framebuff;
+    writer = open_video_out(out_filename, framebuff;
                              framerate, container_private_settings,
                              encoder_settings, scanline_major = true,
                              kwargs...)
@@ -883,7 +883,7 @@ function avi_to_scaled_gray_video(out_filename, in_filename, framerate;
     minv, maxv = extrema(imgs)
     l = make_pixel_lut(minv, maxv, one(N6f10), use_gamma)
     framebuff = Matrix{N6f10}(undef, nx, ny)
-    writer = open_video_out!(out_filename, framebuff; framerate,
+    writer = open_video_out(out_filename, framebuff; framerate,
                              scanline_major = true, container_private_settings,
                              encoder_settings, kwargs...)
     for i in 1:nf
@@ -892,6 +892,52 @@ function avi_to_scaled_gray_video(out_filename, in_filename, framerate;
     end
     close_video_out!(writer)
     nothing
+end
+
+function combine_featherscope_chunks(files, outfile = tempname(); roi_x = :,
+                                     roi_y = :)
+    for file in files
+        isfile(file) ||
+            throw(ArgumentError("File $file does not exist"))
+    end
+    sz = nothing
+    img_raw = nothing
+    gray_img = nothing
+    frame_ranges = Vector{UnitRange{Int}}()
+    open(outfile, "w") do io
+        for file in files
+            r = openvideo(file)
+            eof(r) && error("No video in $file")
+            if img_raw === nothing
+                img = read(r)::PermutedDimsArray{RGB{Normed{UInt8,8}},2,(2, 1),(2, 1),Array{RGB{Normed{UInt8,8}},2}}
+                img_raw = parent(img)
+            else
+                img_raw = read!(r, img_raw)
+            end
+            roi = check_slices(img_raw, roi_x, roi_y)
+            this_sz = length.(roi)
+            if sz === nothing
+                sz = this_sz
+            else
+                sz == this_sz || error("sizes are not the same")
+            end
+            if gray_img === nothing
+                gray_img = similar(img_raw, UInt16, this_sz)
+            end
+            gray_img .= convert_featherscope_rgb.(view(img_raw, roi...))
+            first_frame = isempty(frame_ranges) ? 1 : last(last(frame_ranges)) + 1
+            fno = first_frame
+            write(io, gray_img)
+            while !eof(r)
+                read!(r, img_raw)
+                gray_img .= convert_featherscope_rgb.(view(img_raw, roi...))
+                write(io, gray_img)
+                fno += 1
+            end
+            push!(frame_ranges, first_frame : fno)
+        end
+    end
+    return outfile, sz, frame_ranges
 end
 
 end # module
