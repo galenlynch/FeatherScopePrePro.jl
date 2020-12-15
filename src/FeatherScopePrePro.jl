@@ -24,6 +24,8 @@ using Base.Iterators: peel
 
 using Statistics: mean
 
+using Dates: @dateformat_str, DateTime, Millisecond
+
 using VideoIO: open_video_out, VideoWriter, openvideo, append_encode_mux!,
     close_video_out!
 import VideoIO
@@ -938,6 +940,22 @@ function combine_featherscope_chunks(files, outfile = tempname(); roi_x = :,
         end
     end
     return outfile, sz, frame_ranges
+end
+
+function time_range(vidfile)
+    start_time = parse_bonsai_timestr((vidfile))
+    start_time === nothing && return
+    dur_secs = VideoIO.get_duration(vidfile)
+    stop_time = start_time + Millisecond(round(Int, 1000 * dur_secs))
+    start_time, stop_time
+end
+
+function parse_bonsai_timestr(s)
+    df = dateformat"Y-m-dTH_M_S"
+    dreg = r"(\d{4}-\d{2}-\d{2}T\d{2}_\d{2}_\d{2})"
+    m = match(dreg, s)
+    match === nothing && return
+    DateTime(m[1], df)
 end
 
 end # module
