@@ -6,7 +6,7 @@ using CaProcessing: clip_segments_thr, clip_imgs, demin, map_to_8bit, PixelLUT,
     frame_min_max_accum!, determine_container_depth, make_scale_f,
     make_pixel_lut, apply_lut!
 using GLUtilities: ndx_to_t, t_to_ndx, clip_ndx
-using ColorTypes: Gray, RGB
+using ColorTypes: Gray, RGB, RGB24
 using DataStructures: OrderedDict, CircularBuffer, isfull
 
 using FeatherscopeExtraction: convert_feather_video_frames,
@@ -24,6 +24,8 @@ using Base.Iterators: peel
 
 using Statistics: mean
 
+using ImageOverlays: MutableImage, get_image, grid_lines
+
 using Dates: @dateformat_str, DateTime, Millisecond
 
 using VideoIO: open_video_out, VideoWriter, openvideo, append_encode_mux!,
@@ -40,6 +42,7 @@ export avi_to_scaled_gray_video,
     feather_video_encode_demind_segments,
     feather_video_min_frame_planning,
     feather_video_read_demin_audio,
+    feather_video_read_demean_grid_write,
     streaming_intensities
 
 const AVI_REGEX = r"(?<file_prefix>.*)\.avi$"i
@@ -694,14 +697,14 @@ function frames_min_max_accum_end_exp!(::Type{T}, exposed_range, minf, maxf,
 end
 
 function feather_video_read_demean_write(videof, thr, framerate, outdir
-                                                 = pwd();
-                                                 scratch_dir = tempdir(),
-                                                 nt = nthreads(),
-                                                 use_gamma = false,
-                                                 roi_x::Union{Colon, <:UnitRange} = :,
-                                                 roi_y::Union{Colon, <:UnitRange} = :,
-                                                 shutter_delay = 1, force = false,
-                                                 kwargs...)
+                                         = pwd();
+                                         scratch_dir = tempdir(),
+                                         nt = nthreads(),
+                                         use_gamma = false,
+                                         roi_x::Union{Colon, <:UnitRange} = :,
+                                         roi_y::Union{Colon, <:UnitRange} = :,
+                                         shutter_delay = 1, force = false,
+                                         kwargs...)
     imgs = reinterpret(UInt16,
                        convert_feather_video_frames(videof, scratch_dir = scratch_dir))
     img_stack = [view(imgs, :, :, i) for i in 1:size(imgs, 3)]
@@ -722,6 +725,39 @@ function feather_video_read_demean_write(videof, thr, framerate, outdir
         new_vid_path = joinpath(outdir,
                                 demeaned_video_name(videof, exposed_range))
         write_demeaned_video(f, rawtype(outT), new_vid_path, img_block, meanf,
+                             framerate; force, kwargs...)
+    end
+end
+
+function feather_video_read_demean_grid_write(videof, thr, framerate, outdir
+                                              = pwd();
+                                              scratch_dir = tempdir(),
+                                              nt = nthreads(),
+                                              use_gamma = false,
+                                              roi_x::Union{Colon, <:UnitRange} = :,
+                                              roi_y::Union{Colon, <:UnitRange} = :,
+                                              shutter_delay = 1, force = false,
+                                              kwargs...)
+    imgs = reinterpret(UInt16,
+                       convert_feather_video_frames(videof, scratch_dir = scratch_dir))
+    img_stack = [view(imgs, :, :, i) for i in 1:size(imgs, 3)]
+    new_exposure_f = (img, args...) -> frames_min_max_accum_new_exp!(UInt32,
+                                                                     img,
+                                                                     args...)
+    end_exposure_f = (args...) -> frames_min_max_accum_end_exp!(Float32,
+                                                                args...;
+                                                                use_gamma = false)
+    thr_scaled = thr * reinterpret(one(N6f10))
+    outs, exposed_ranges = exposure_map!(new_exposure_f,
+                                         frames_min_max_accum_grow_exp!,
+                                         end_exposure_f, thr_scaled, img_stack;
+                                         roi_x = roi_x, roi_y = roi_y,
+                                         shutter_delay)
+    for ((outT, f, meanf), exposed_range) in zip(outs, exposed_ranges)
+        img_block = [view(imgs, roi_x, roi_y, j) for j in exposed_range]
+        new_vid_path = joinpath(outdir,
+                                demeaned_video_name(videof, exposed_range))
+        write_demeaned_grid_video(f, rawtype(outT), new_vid_path, img_block, meanf,
                              framerate; force, kwargs...)
     end
 end
@@ -747,9 +783,39 @@ function write_demeaned_video(f, ::Type{T}, out_filename, img_stack, meanf,
     try
         for i in eachindex(img_stack)
             this_img = img_stack[i]
-            for j in eachindex(img_stack[i])
+            for j in eachindex(this_img)
                 framebuff[j] = f(this_img[j] - meanf[j])
             end
+            append_encode_mux!(writer, framebuff, i - 1)
+        end
+    catch
+        isfile(out_filename) && rm(out_filename, force = true)
+        rethrow()
+    finally
+        close_video_out!(writer)
+    end
+    nothing
+end
+
+function write_demeaned_grid_video(f, ::Type{T}, out_filename, img_stack, meanf,
+                                   framerate; force = false,
+                                   kwargs...) where T<:UInt8
+    force_file_check(out_filename, force)
+    first_img = first(img_stack)
+    framebuff = similar(first_img, T)
+    gridbuff = MutableImage(RGB24, size(first_img))
+    rgbbuff = get_image(gridbuff)
+    writer = open_video_out(out_filename, framebuff; framerate,
+                            scanline_major = true, kwargs...)
+    try
+        for i in eachindex(img_stack)
+            this_img = img_stack[i]
+            for j in eachindex(this_img)
+                val = reinterpret(N0f8, f(this_img[j] - meanf[j]))
+                rgbbuff[j] = convert(RGB24, Gray(val))
+            end
+            grid_lines(gridbuff)
+            framebuff .= reinterpret(T, convert.(Gray{N0f8}, get_image(gridbuff)))
             append_encode_mux!(writer, framebuff, i - 1)
         end
     catch
