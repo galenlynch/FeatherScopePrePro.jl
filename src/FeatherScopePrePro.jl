@@ -5,7 +5,7 @@ using CaProcessing: clip_segments_thr, clip_imgs, demin, map_to_8bit, PixelLUT,
     get_norm, frames_min_max_accum_alloc, frames_min_max_accum_init!,
     frame_min_max_accum!, determine_container_depth, make_scale_f,
     make_pixel_lut, apply_lut!
-using GLUtilities: ndx_to_t, t_to_ndx, clip_ndx
+using GLUtilities: ndx_to_t, t_to_ndx, clip_ndx, find_all_edge_triggers
 using ColorTypes: Gray, RGB, RGB24
 using DataStructures: OrderedDict, CircularBuffer, isfull
 
@@ -22,7 +22,7 @@ using WAV: wavwrite, WAVE_FORMAT_PCM
 using Base.Threads: @spawn, nthreads
 using Base.Iterators: peel
 
-using Statistics: mean
+using Statistics: mean, median
 
 using ImageOverlays: MutableImage, get_image, grid_lines
 
@@ -39,11 +39,18 @@ export avi_to_scaled_gray_video,
     avi_to_tiff_demin,
     avi_to_tiff_raw,
     find_exposed_frame_ranges,
+    file_triplets,
     feather_video_encode_demind_segments,
     feather_video_min_frame_planning,
     feather_video_read_demin_audio,
     feather_video_read_demean_grid_write,
-    streaming_intensities
+    measure_framerate,
+    streaming_intensities,
+    sync_triplets,
+    triplet_sync_info,
+    video_sync_alignment
+
+include("sync.jl")
 
 const AVI_REGEX = r"(?<file_prefix>.*)\.avi$"i
 const JSON_DICT_TYPE = OrderedDict{String, Any}
