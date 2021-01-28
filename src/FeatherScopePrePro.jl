@@ -11,7 +11,8 @@ using DataStructures: OrderedDict, CircularBuffer, isfull
 
 using FeatherscopeExtraction: convert_feather_video_frames,
     convert_featherscope_rgb, open_audio_sync, FEATHER_VIDEO_REG,
-    FEATHER_SYNC_REG, sync_searchreg, video_sync_alignment, frame_iter_preamble
+    FEATHER_SYNC_REG, sync_searchreg, frame_iter_preamble, file_triplets,
+    open_utinstants
 
 using FileIO: save
 using FixedPointNumbers: Normed, N6f10, N0f8, N8f8, rawtype # need reinterpret method
@@ -29,7 +30,7 @@ using ImageOverlays: MutableImage, get_image, grid_lines
 using Dates: @dateformat_str, DateTime, Millisecond
 
 using VideoIO: open_video_out, VideoWriter, openvideo, append_encode_mux!,
-    close_video_out!
+    close_video_out!, get_number_frames
 import VideoIO
 
 import FFMPEG
@@ -39,7 +40,6 @@ export avi_to_scaled_gray_video,
     avi_to_tiff_demin,
     avi_to_tiff_raw,
     find_exposed_frame_ranges,
-    file_triplets,
     feather_video_encode_demind_segments,
     feather_video_min_frame_planning,
     feather_video_read_demin_audio,
@@ -871,18 +871,16 @@ function update_exposure_first_frame(ignore_exposure, intensity, thr)
 end
 
 """
-    find_first_exposed_frame(fname, thr, roi_x = :, roi_y = : ;
-                             nt = nthreads(), shutter_delay = 1,
-                             skip_exposure_at_start = true) -> Union{Int, Nothing}
+    find_first_exposure_edge(fname, thr, roi_x = :, roi_y = : ;
+                             nt = nthreads(), shutter_delay = 1) -> Union{Int, Nothing}
 
 Find the average intensity in the roi of successive frames of `fname`, and
 return the frame number where the intensity is greater than or equal to `thr`.
 If `fname` is empty, or if all frames have an average intensity in the roi less
 than `thr`, then return `nothing`.
 """
-function find_first_exposed_frame(fname, thr, roi_x = :, roi_y = : ;
-                                  nt = nthreads(), shutter_delay = 1,
-                                  skip_exposure_at_start = true)
+function find_first_exposure_edge(fname, thr, roi_x = :, roi_y = : ;
+                                  nt = nthreads(), shutter_delay = 1)
     outs = frame_iter_preamble(fname)
     outs === nothing && return nothing
     r, img_raw = outs
@@ -892,7 +890,8 @@ function find_first_exposed_frame(fname, thr, roi_x = :, roi_y = : ;
     fno = 1
     intensity = frame_avg_intensity(convert_featherscope_rgb,
                                     UInt64, img_raw, norm; roi_xr, roi_yr, nt)
-    ignore_exposure, is_exposed = update_exposure_first_frame(skip_exposure_at_start,
+    ignore_exposure = intensity >= thr
+    ignore_exposure, is_exposed = update_exposure_first_frame(ignore_exposure,
                                                               intensity, thr)
     nexposed = ifelse(is_exposed, 1, 0)
     while !eof(r) & (nexposed <= shutter_delay)
@@ -909,7 +908,7 @@ end
 
 function find_exposed_frame_ranges(fname, thr, roi_x = :, roi_y = : ;
                                    nt = nthreads(), shutter_delay = 1,
-                                   skip_exposure_at_start = true)
+                                   skip_exposure_at_start = false)
     out = Vector{UnitRange{Int}}()
     frame_info = frame_iter_preamble(fname)
     frame_info === nothing && return out
