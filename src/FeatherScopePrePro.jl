@@ -931,8 +931,11 @@ function find_exposed_frame_ranges(fname, thr, roi_x = :, roi_y = : ;
                                                                   intensity, thr)
         if !is_exposed & (nexposed > shutter_delay) # Leaving exposure
             last_exposed = fno - 1
-            push!(out, last_exposed - nexposed + shutter_delay + 1:
-                  last_exposed - shutter_delay)
+            raw_start_of_exposure = last_exposed - nexposed + 1
+            # Account for shutter delay unless exposure goes to start of file
+            start_of_exposure = raw_start_of_exposure +
+                ifelse(raw_start_of_exposure == 1, 0, shutter_delay)
+            push!(out, start_of_exposure : last_exposed - shutter_delay)
         end
         nexposed = ifelse(is_exposed, nexposed + 1, 0)
     end
