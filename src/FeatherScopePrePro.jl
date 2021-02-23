@@ -4,7 +4,7 @@ using CaProcessing: clip_segments_thr, clip_imgs, demin, map_to_8bit, PixelLUT,
     pixel_lut, rescale_compress, max_container_depth, frame_avg_intensity,
     get_norm, frames_min_max_accum_alloc, frames_min_max_accum_init!,
     frame_min_max_accum!, determine_container_depth, make_scale_f,
-    make_pixel_lut, apply_lut!
+    make_pixel_lut, apply_lut!, maxval_min_max_frames
 using GLUtilities: ndx_to_t, t_to_ndx, clip_ndx, find_all_edge_triggers
 using ColorTypes: Gray, RGB, RGB24
 using DataStructures: OrderedDict, CircularBuffer, isfull
@@ -126,6 +126,12 @@ end
 function check_slices(img, roi_x, roi_y)
     checkbounds(img, roi_x, roi_y)
     to_indices(img, (roi_x, roi_y))
+end
+
+function determine_if_frame_exposed(img_raw, roi_xr, roi_yr, norm, thr, nt = nthreads())
+    frame_intensity = frame_avg_intensity(convert_featherscope_rgb, UInt64,
+                                          img_raw, norm; nt, roi_xr, roi_yr)
+    frame_intensity >= thr
 end
 
 function feather_video_min_frame_planning(input_fname, thr, roi_x = :,
@@ -288,8 +294,6 @@ end
 
 struct FrameEncoderState{T}
     lut::PixelLUT{T}
-    io::IOStream
-    s_fpath::String
     writer::VideoWriter
 end
 
@@ -301,7 +305,7 @@ function start_encode(out_filename, graybuf, framerate, container_settings,
     writer = open_video_out(out_filename, writebuf; framerate,
                              container_settings, container_private_settings,
                              encoder_settings, encoder_private_settings)
-    return io, s_fpath, encoder
+    return writer
 end
 
 function append_frame!(encoder_state, graybuf, fno)
@@ -319,7 +323,7 @@ function append_demind_video_frame!(encoder_state, exposure_no, graybuf, img_raw
                                     encoder_private_settings, force)
     if encoder_state === nothing
         if fno in exposed_range
-            io, s_fpath, encoder = start_encode(out_filename, graybuf, framerate,
+            writer = start_encode(out_filename, graybuf, framerate,
                                                 container_settings,
                                                 container_private_settings,
                                                 encoder_settings,
@@ -333,7 +337,7 @@ function append_demind_video_frame!(encoder_state, exposure_no, graybuf, img_raw
             else
                 lut = pixel_lut(x -> convert(Tout, maxv_scale * x), sub_maxv)
             end
-            encoder_state = FrameEncoderState(lut, io, s_fpath, encoder)
+            encoder_state = FrameEncoderState(lut, writer)
             demin_frame!(graybuf, img_raw, min_frame, encoder_state.lut, roi_xr,
                          roi_yr)
             append_frame!(encoder_state, graybuf, fno)
@@ -344,7 +348,7 @@ function append_demind_video_frame!(encoder_state, exposure_no, graybuf, img_raw
                          roi_yr)
             append_frame!(encoder_state, graybuf, fno)
         else # finish encode
-            finish_encode(encoder_state, exposed_range, framerate)
+            finish_encode(encoder_state)
             encoder_state = nothing
             exposure_no += 1
         end
@@ -367,12 +371,13 @@ function feather_video_encode_demind_segments(input_fname, roi_x, roi_y,
                                               (movflags = "+write_colr",),
                                               encoder_settings = (color_range = 2,),
                                               encoder_private_settings =
-                                              (crf = 20, preset = "medium"))
+                                              (crf = 20, preset = "medium"),
+                                              force_video = false)
     nexposure = length(exposed_ranges)
     nexposure > 0 || return String[]
     isdir(writedir) || throw(ArgumentError("Cannot access write directory $writedir"))
     base_name = basename(input_fname)
-    video_names = joinpath(writedir, def_fname_f.(base_name, exposed_ranges))
+    video_names = joinpath.(writedir, def_fname_f.(base_name, exposed_ranges))
 
     outs = frame_iter_preamble(input_fname)
     outs === nothing && return String[]
@@ -390,7 +395,7 @@ function feather_video_encode_demind_segments(input_fname, roi_x, roi_y,
         subtracted_maxvals[exposure_no], fno, roi_xr, roi_yr,
         video_names[exposure_no], framerate, use_gamma_compression,
         container_settings, container_private_settings,
-        encoder_settings, encoder_private_settings
+        encoder_settings, encoder_private_settings, force_video
     )
 
     while !eof(inputvid) && exposure_no <= nexposure
@@ -403,13 +408,12 @@ function feather_video_encode_demind_segments(input_fname, roi_x, roi_y,
             video_names[exposure_no], framerate,
             use_gamma_compression, container_settings,
             container_private_settings,
-            encoder_settings, encoder_private_settings
+            encoder_settings, encoder_private_settings, force_video
         )
     end
 
     if encoder_state !== nothing
-        finish_encode(encoder_state, video_names[exposure_no],
-                      exposed_ranges[nexposure], framerate)
+        finish_encode(encoder_state)
     end
 
     return joinpath.(writedir, video_names)
@@ -504,8 +508,8 @@ function feather_video_read_demin_audio(videof::AbstractString,
                                         shutter_offset = 1, fs_sync = 48000,
                                         force_video = false,
                                         use_gamma_compression = true,
-                                        encoder_properties = (;),
-                                        encoder_private_properties = (;),
+                                        encoder_settings = (;),
+                                        encoder_private_settings = (;),
                                         kwargs...)
     # Find exposed portions of the video and make subtracted videos
     min_frames, subtracted_maxvals, exposed_ranges, nf =
