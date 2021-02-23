@@ -45,6 +45,7 @@ export avi_to_scaled_gray_video,
     feather_video_min_frame_planning,
     feather_video_read_demin_audio,
     feather_video_read_demean_grid_write,
+    feather_video_read_demean_write_audio,
     measure_framerate,
     streaming_intensities,
     sync_triplets,
@@ -754,8 +755,7 @@ function feather_video_read_demean_grid_write(videof, thr, framerate, outdir
                                               roi_y::Union{Colon, <:UnitRange} = :,
                                               shutter_delay = 1, force = false,
                                               kwargs...)
-    imgs = reinterpret(UInt16,
-                       convert_feather_video_frames(videof, scratch_dir = scratch_dir))
+    imgs = reinterpret(UInt16, convert_feather_video_frames(videof; scratch_dir))
     img_stack = [view(imgs, :, :, i) for i in 1:size(imgs, 3)]
     new_exposure_f = (img, args...) -> frames_min_max_accum_new_exp!(UInt32,
                                                                      img,
