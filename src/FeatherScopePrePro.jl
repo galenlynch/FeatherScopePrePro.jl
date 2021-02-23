@@ -471,9 +471,9 @@ function feather_sync_add_audio(syncf, out_filenames, exposed_ranges, sync_frame
             mv(out_filenames[exposure_no], temp_video_f, force = force_video)
             try
                 # join video and audio
-                FFMPEG.exe(`-y -i $(temp_video_f) -i $(temp_audio_f) -c:v copy
-                            -c:a aac -map 0:v:0 -map 1:a:0
-                            $(out_filenames[exposure_no])`)
+                FFMPEG.exe(`-y -hide_banner -i $(temp_video_f)
+                            -i $(temp_audio_f) -c:v copy -c:a aac -map 0:v:0
+                            -map 1:a:0 $(out_filenames[exposure_no])`)
             finally
                 rm(temp_video_f)
             end
@@ -481,6 +481,21 @@ function feather_sync_add_audio(syncf, out_filenames, exposed_ranges, sync_frame
             rm(temp_audio_f)
         end
     end
+end
+
+function find_matching_syncf(videof)
+    videomatch = match(FEATHER_VIDEO_REG, videof)
+    videomatch === nothing && throw(ArgumentError("Could not parse $videof to find its datetime"))
+    searchreg = sync_searchreg(videomatch)
+    searchdir = splitdir(videof)[1]
+    if isempty(searchdir)
+        dirlisting = readdir()
+    else
+        dirlisting = readdir(searchdir)
+    end
+    syncf_ndx = findfirst(x -> occursin(searchreg, x), dirlisting)
+    syncf_ndx === nothing && throw(error("Could not find sync file for $videof"))
+    joinpath(searchdir, dirlisting[syncf_ndx])
 end
 
 function feather_video_read_demin_audio(videof::AbstractString,
@@ -527,25 +542,9 @@ function feather_video_read_demin_audio(videof::AbstractString,
     end
 end
 
-function dither_noise(scale::Number = 1)
-    samp = rand() + rand()
-    samp * scale / 2
-end
-
 function feather_video_read_demin_audio(videof::AbstractString, thr::Real,
                                         args...; kwargs...)
-    videomatch = match(FEATHER_VIDEO_REG, videof)
-    videomatch === nothing && throw(ArgumentError("Could not parse $videof to find its datetime"))
-    searchreg = sync_searchreg(videomatch)
-    searchdir = splitdir(videof)[1]
-    if isempty(searchdir)
-        dirlisting = readdir()
-    else
-        dirlisting = readdir(searchdir)
-    end
-    syncf_ndx = findfirst(x -> occursin(searchreg, x), dirlisting)
-    syncf_ndx === nothing && throw(error("Could not find sync file for $videof"))
-    syncpath = joinpath(searchdir, dirlisting[syncf_ndx])
+    syncpath = find_matching_syncf(videof)
     feather_video_read_demin_audio(videof, syncpath, thr, args...; kwargs...)
 end
 
@@ -727,13 +726,17 @@ function feather_video_read_demean_write(videof, thr, framerate, outdir
                                          end_exposure_f, thr_scaled, img_stack;
                                          roi_x = roi_x, roi_y = roi_y,
                                          shutter_delay)
-    for ((outT, f, meanf), exposed_range) in zip(outs, exposed_ranges)
+    nexp = length(exposed_ranges)
+    vid_paths = Vector{String}(undef, nexp)
+    for (i, ((outT, f, meanf), exposed_range)) in enumerate(zip(outs, exposed_ranges))
         img_block = [view(imgs, roi_x, roi_y, j) for j in exposed_range]
         new_vid_path = joinpath(outdir,
                                 demeaned_video_name(videof, exposed_range))
         write_demeaned_video(f, rawtype(outT), new_vid_path, img_block, meanf,
                              framerate; force, kwargs...)
+        vid_paths[i] = new_vid_path
     end
+    vid_paths, exposed_ranges
 end
 
 function feather_video_read_demean_grid_write(videof, thr, framerate, outdir
@@ -802,6 +805,52 @@ function write_demeaned_video(f, ::Type{T}, out_filename, img_stack, meanf,
         close_video_out!(writer)
     end
     nothing
+end
+
+function feather_video_read_demean_write_audio(videof::AbstractString,
+                                               syncf::AbstractString, thr,
+                                               framerate, outdir = pwd();
+                                               shutter_offset = 1,
+                                               fs_sync = 48000,
+                                               force_video = false,
+                                               scratch_dir = tempdir(),
+                                               nt = nthreads(),
+                                               use_gamma = false,
+                                               roi_x::Union{Colon, <:UnitRange} = :,
+                                               roi_y::Union{Colon, <:UnitRange} = :,
+                                               shutter_delay = 1, force = false,
+                                               demean_kwargs = (;),
+                                               audio_kwargs = (;))
+    vid_paths, exposed_ranges =
+        feather_video_read_demean_write(videof, thr, framerate, outdir;
+                                        scratch_dir, nt, use_gamma, roi_x,
+                                        roi_y, shutter_delay, force,
+                                        demean_kwargs...)
+    nexposed = length(exposed_ranges)
+    nexposed == 0 && return vid_paths
+    first_exposure_nosync = first(exposed_ranges[1]) == 1
+    first_exposure_nosync && nexposed == 1 && return vid_paths
+    sync_exposed_frameno = first_exposure_nosync ? exposed_ranges[2][1] :
+        exposed_ranges[1][1]
+    try
+        feather_sync_add_audio(syncf, vid_paths, exposed_ranges,
+                               sync_exposed_frameno, framerate, outdir,
+                               shutter_offset, fs_sync, force, nexposed;
+                               audio_kwargs...)
+    catch
+        for f in vid_paths
+            isfile(f) && rm(f)
+        end
+        rethrow()
+    end
+    vid_paths
+end
+
+function feather_video_read_demean_write_audio(videof::AbstractString, thr::Real,
+                                              args...; kwargs...)
+    syncpath = find_matching_syncf(videof)
+    feather_video_read_demean_write_audio(videof, syncpath, thr, args...;
+                                          kwargs...)
 end
 
 function write_demeaned_grid_video(f, ::Type{T}, out_filename, img_stack, meanf,
