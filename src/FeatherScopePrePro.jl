@@ -10,9 +10,9 @@ using ColorTypes: Gray, RGB, RGB24
 using DataStructures: OrderedDict, CircularBuffer, isfull
 
 using FeatherscopeExtraction: convert_feather_video_frames,
-    convert_featherscope_rgb, open_audio_sync, FEATHER_VIDEO_REG,
-    FEATHER_SYNC_REG, sync_searchreg, frame_iter_preamble, file_triplets,
-    open_utinstants
+    convert_featherscope_rgb, open_audio_sync,
+    FEATHER_VIDEO_REG, FEATHER_SYNC_REG, sync_searchreg, frame_iter_preamble,
+    file_triplets, open_utinstants
 
 using FileIO: save
 using FixedPointNumbers: Normed, N6f10, N0f8, N8f8, rawtype # need reinterpret method
@@ -524,13 +524,14 @@ function feather_video_read_demin_audio(videof::AbstractString,
     first_exposure_nosync && nexposed == 1 && return String[]
 
     out_filenames = feather_video_encode_demind_segments(videof, roi_x, roi_y,
-                                                      min_frames,
-                                                      subtracted_maxvals,
-                                                      exposed_ranges, framerate,
-                                                      writedir;
-                                                      use_gamma_compression,
-                                                      encoder_properties,
-                                                      encoder_private_properties)
+                                                         min_frames,
+                                                         subtracted_maxvals,
+                                                         exposed_ranges, framerate,
+                                                         writedir;
+                                                         use_gamma_compression,
+                                                         encoder_settings,
+                                                         encoder_private_settings,
+                                                         force_video)
 
     sync_exposed_frameno = first_exposure_nosync ? exposed_ranges[2][1] :
                                                    exposed_ranges[1][1]
