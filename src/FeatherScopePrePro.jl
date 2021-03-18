@@ -1026,9 +1026,8 @@ function avi_to_scaled_gray_video(out_filename, in_filename, framerate;
     nothing
 end
 
-function combine_featherscope_chunks(files, outfile = tempname(); roi_x = :,
-                                     roi_y = :)
-    for file in files
+function combine_featherscope_chunks(outfile, in_files; roi_x = :, roi_y = :)
+    for file in in_files
         isfile(file) ||
             throw(ArgumentError("File $file does not exist"))
     end
@@ -1037,7 +1036,7 @@ function combine_featherscope_chunks(files, outfile = tempname(); roi_x = :,
     gray_img = nothing
     frame_ranges = Vector{UnitRange{Int}}()
     open(outfile, "w") do io
-        for file in files
+        for file in in_files
             r = openvideo(file)
             eof(r) && error("No video in $file")
             if img_raw === nothing
@@ -1069,7 +1068,7 @@ function combine_featherscope_chunks(files, outfile = tempname(); roi_x = :,
             push!(frame_ranges, first_frame : fno)
         end
     end
-    return outfile, sz, frame_ranges
+    return sz, frame_ranges
 end
 
 function time_range(vidfile)
