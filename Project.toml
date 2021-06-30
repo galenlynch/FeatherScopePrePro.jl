@@ -1,7 +1,7 @@
 name = "FeatherScopePrePro"
 uuid = "37bac92b-e4c2-480a-b015-8005f9486f30"
 authors = ["Galen Lynch <galen.lynch@gmail.com>"]
-version = "0.1.7"
+version = "0.1.8"
 
 [deps]
 CaProcessing = "5d3dd9f5-cffe-4d9b-8768-e5b1153cff1e"
@@ -23,7 +23,7 @@ WAV = "8149f6b0-98f6-5db9-b78f-408fbbb8ef88"
 
 [compat]
 CaProcessing = "0.1.1"
-ColorTypes = "0.10"
+ColorTypes = "0.10 - 0.11"
 DataStructures = "0.17 - 0.18"
 FeatherscopeExtraction = "0.2 - 0.3"
 FileIO = "1.3"
