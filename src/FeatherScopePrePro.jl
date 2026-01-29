@@ -4,15 +4,16 @@ using CaProcessing: clip_segments_thr, clip_imgs, demin, map_to_8bit, PixelLUT,
     pixel_lut, rescale_compress, max_container_depth, frame_avg_intensity,
     get_norm, frames_min_max_accum_alloc, frames_min_max_accum_init!,
     frame_min_max_accum!, determine_container_depth, make_scale_f,
-    make_pixel_lut, apply_lut!, maxval_min_max_frames
+    make_pixel_lut, apply_lut!, maxval_min_max_frames, median_filter_frames!
 using GLUtilities: ndx_to_t, t_to_ndx, clip_ndx, find_all_edge_triggers
 using ColorTypes: Gray, RGB, RGB24
 using DataStructures: OrderedDict, CircularBuffer, isfull
 
 using FeatherscopeExtraction: convert_feather_video_frames,
     convert_featherscope_rgb, open_audio_sync,
-    FEATHER_VIDEO_REG, FEATHER_SYNC_REG, sync_searchreg, frame_iter_preamble,
-    file_triplets, open_utinstants
+    FEATHER_VIDEO_REG, FEATHER_SYNC_REG, FEATHER_SYNC_HIGH,
+    FEATHER_SHUTTER_HIGH, sync_searchreg, frame_iter_preamble, file_triplets,
+    open_utinstants
 
 using FileIO: save
 using FixedPointNumbers: Normed, N6f10, N0f8, N8f8, rawtype # need reinterpret method
@@ -32,6 +33,8 @@ using Dates: @dateformat_str, DateTime, Millisecond
 using VideoIO: open_video_out, VideoWriter, openvideo, close_video_out!,
     get_number_frames
 import VideoIO
+
+using Mmap: mmap
 
 import FFMPEG
 
@@ -134,6 +137,71 @@ function determine_if_frame_exposed(img_raw, roi_xr, roi_yr, norm, thr, nt = nth
     frame_intensity = frame_avg_intensity(convert_featherscope_rgb, UInt64,
                                           img_raw, norm; nt, roi_xr, roi_yr)
     frame_intensity >= thr
+end
+
+function feather_video_exposed_medfilter_blocks(videof, thr, filter_npt,
+                                                roi_x = :, roi_y = :;
+                                                scratch_dir = "", nt = 1)
+    frames = reinterpret(UInt16,
+                         convert_feather_video_frames_roi(videof; scratch_dir,
+                                                          roi_x, roi_y))
+    isempty(frames) && error("empty video")
+    exposed_ranges = find_exposed_frame_ranges(frames, thr; nt)
+    nexp = sum(length, exposed_ranges)
+    nx, ny, nf = size(frames)
+    outb = maybe_mmap(Float32, (nx, ny, nexp), scratch_dir)
+    last_exp = 0
+    for exp_r in exposed_ranges
+        nexpf = length(exp_r)
+        out_range = last_exp + 1 : last_exp + nexpf
+        vb, ve = extrema(view(frames, :, :, exp_r))
+        median_filter_frames!(view(outb, :, :, out_range),
+                              view(frames, :, :, exp_r),
+                              filter_npt, vb:ve; discrete = true, nt)
+        last_exp += nexpf
+    end
+    outb, exposed_ranges
+end
+
+function mpeg_range(bitdepth = 8)
+    b = 16 * 2 ^ (bitdepth - 8)
+    e = b + 219 * 2 ^ (bitdepth - 8)
+    (b, e)
+end
+
+function centerval_8bit_gray_encode(vfname, buff, framerate,
+                                    neg_range = 1.0, pos_range = 1.0;
+                                    scanline_major = true,
+                                    encoder_options = (crf = 20, preset = "veryslow"),
+                                    target_pix_fmt = VideoIO.AV_PIX_FMT_YUV420P,
+                                    input_colorspace_details =
+                                        VideoIO.VioColorspaceDetails(),
+                                    bitdepth = 8)
+    nx, ny, nf = size(buff)
+    minv, maxv = extrema(buff)
+    clamp_min = minv < 0 ? neg_range * minv : minv
+    clamp_max = maxv > 0 ? pos_range * maxv : maxv
+    encode_buff = Matrix{RGB{N0f8}}(undef, nx, ny)
+    writer = open_video_out(vfname, encode_buff; framerate, scanline_major,
+                            encoder_options, input_colorspace_details)
+    b, e = mpeg_range(bitdepth)
+    mpeg_r = e - b
+    for i in 1:nf
+        encode_buff .= Gray.(reinterpret.(
+            N0f8,
+            rescale_clamp_brightness.(UInt8, view(), clamp_min,
+                                      clamp_max, e - b) .+ UInt8(b)
+        ))
+        write(wrtiter, encode_buff, i - 1)
+    end
+    close_video_out!(writer)
+end
+
+function fv_exp_medfilt_gray_encode(videof, thr, filter_npt, args...; kwargs...)
+    outb, exposed_ranges = feather_video_exposed_medfilter_blocks(videof, thr,
+                                                                  filter_npt,
+                                                                  args...;
+                                                                  kwargs...)
 end
 
 function feather_video_min_frame_planning(input_fname, thr, roi_x = :,
@@ -940,7 +1008,7 @@ function find_first_exposure_edge(fname, thr, roi_x = :, roi_y = : ;
     outs === nothing && return nothing
     r, img_raw = outs
     roi_xr, roi_yr = check_slices(img_raw, roi_x, roi_y)
-    norm = get_norm(roi_xr, roi_yr)
+    norm = get_norm(roi_xr, roi_yr) / 1023
 
     fno = 1
     intensity = frame_avg_intensity(convert_featherscope_rgb,
@@ -948,6 +1016,7 @@ function find_first_exposure_edge(fname, thr, roi_x = :, roi_y = : ;
     ignore_exposure = intensity >= thr
     ignore_exposure, is_exposed = update_exposure_first_frame(ignore_exposure,
                                                               intensity, thr)
+    crossingno = ifelse(is_exposed, 1, 0)
     nexposed = ifelse(is_exposed, 1, 0)
     while !eof(r) & (nexposed <= shutter_delay)
         fno += 1
@@ -957,19 +1026,21 @@ function find_first_exposure_edge(fname, thr, roi_x = :, roi_y = : ;
         ignore_exposure, is_exposed = update_exposure_first_frame(ignore_exposure,
                                                                   intensity, thr)
         nexposed = ifelse(is_exposed, nexposed + 1, 0)
+        crossingno += ifelse(nexposed == 1, 1, 0)
     end
-    return eof(r) ? nothing : fno
+    return eof(r) ? nothing : (fno, crossigno)
 end
 
-function find_exposed_frame_ranges(fname, thr, roi_x = :, roi_y = : ;
-                                   nt = nthreads(), shutter_delay = 1,
+function find_exposed_frame_ranges(fname::AbstractString, thr, roi_x = :,
+                                   roi_y = : ; nt = nthreads(),
+                                   shutter_delay = 1,
                                    skip_exposure_at_start = false)
     out = Vector{UnitRange{Int}}()
     frame_info = frame_iter_preamble(fname)
     frame_info === nothing && return out
     r, img_raw = frame_info
     roi_xr, roi_yr = check_slices(img_raw, roi_x, roi_y)
-    norm = get_norm(roi_xr, roi_yr)
+    norm = get_norm(roi_xr, roi_yr) / 1023
 
     fno = 1
     intensity = frame_avg_intensity(convert_featherscope_rgb, UInt64, img_raw,
@@ -1001,6 +1072,46 @@ function find_exposed_frame_ranges(fname, thr, roi_x = :, roi_y = : ;
     out
 end
 
+
+function find_exposed_frame_ranges(frames::AbstractArray{<:Integer, 3}, thr, roi_x = :,
+                                   roi_y = : ; nt = nthreads(),
+                                   shutter_delay = 1,
+                                   skip_exposure_at_start = false)
+    out = Vector{UnitRange{Int}}()
+    nf = size(frames, 3)
+    nf > 0 || return out
+    img_raw = view(frames, :, :, 1)
+    roi_xr, roi_yr = check_slices(img_raw, roi_x, roi_y)
+    norm = get_norm(roi_xr, roi_yr) / 1023
+
+    intensity = frame_avg_intensity(identity, UInt64, img_raw,
+                                    norm; roi_xr, roi_yr, nt)
+    ignore_exposure, is_exposed = update_exposure_first_frame(skip_exposure_at_start,
+                                                              intensity, thr)
+    nexposed = ifelse(is_exposed, 1, 0)
+    for fno in 2:nf
+        img_raw = view(frames, :, :, fno)
+        intensity = frame_avg_intensity(identity, UInt64,
+                                        img_raw, norm; roi_xr, roi_yr, nt)
+        ignore_exposure, is_exposed = update_exposure_first_frame(ignore_exposure,
+                                                                  intensity, thr)
+        if !is_exposed & (nexposed > shutter_delay) # Leaving exposure
+            last_exposed = fno - 1
+            raw_start_of_exposure = last_exposed - nexposed + 1
+            # Account for shutter delay unless exposure goes to start of file
+            start_of_exposure = raw_start_of_exposure +
+                ifelse(raw_start_of_exposure == 1, 0, shutter_delay)
+            push!(out, start_of_exposure : last_exposed - shutter_delay)
+        end
+        nexposed = ifelse(is_exposed, nexposed + 1, 0)
+    end
+    if nexposed > shutter_delay # Unfinished exposure
+        # Do not account for the delay in the shutter closing at the end of file
+        push!(out, nf - nexposed + shutter_delay + 1: nf)
+    end
+    out
+end
+
 function avi_to_scaled_gray_video(out_filename, in_filename, framerate;
                                   scratch_dir = "", nt = nthreads(),
                                   use_gamma = false, force = false,
@@ -1026,17 +1137,23 @@ function avi_to_scaled_gray_video(out_filename, in_filename, framerate;
     nothing
 end
 
-function combine_featherscope_chunks(outfile, in_files; roi_x = :, roi_y = :)
+function combine_featherscope_chunks(outfile, in_files, in_frame_ranges = nothing;
+                                     roi_x = :, roi_y = :)
     for file in in_files
         isfile(file) ||
             throw(ArgumentError("File $file does not exist"))
+    end
+    if in_frame_ranges !== nothing
+        if length(in_frame_ranges) != length(in_files)
+            throw(ArgumentError("in_frame_ranges must be `nothing` or same length as `in_files`"))
+        end
     end
     sz = nothing
     img_raw = nothing
     gray_img = nothing
     frame_ranges = Vector{UnitRange{Int}}()
     open(outfile, "w") do io
-        for file in in_files
+        for (file_no, file) in enumerate(in_files)
             r = openvideo(file)
             eof(r) && error("No video in $file")
             if img_raw === nothing
@@ -1055,15 +1172,23 @@ function combine_featherscope_chunks(outfile, in_files; roi_x = :, roi_y = :)
             if gray_img === nothing
                 gray_img = similar(img_raw, UInt16, this_sz)
             end
+            local_fno = 1
+            if in_frame_ranges !== nothing
+                while local_fno < in_frame_ranges[file_no][1]
+                    read!(r, img_raw)
+                    local_fno += 1
+                end
+            end
             gray_img .= convert_featherscope_rgb.(view(img_raw, roi...))
             first_frame = isempty(frame_ranges) ? 1 : last(last(frame_ranges)) + 1
             fno = first_frame
             write(io, gray_img)
-            while !eof(r)
+            while !eof(r) && in_frame_ranges !== nothing && local_fno <= last(in_frame_ranges[file_no])
                 read!(r, img_raw)
                 gray_img .= convert_featherscope_rgb.(view(img_raw, roi...))
                 write(io, gray_img)
                 fno += 1
+                local_fno += 1
             end
             push!(frame_ranges, first_frame : fno)
         end
@@ -1085,6 +1210,41 @@ function parse_bonsai_timestr(s)
     m = match(dreg, s)
     match === nothing && return
     DateTime(m[1], df)
+end
+
+function maybe_mmap(::Type{T}, sz::NTuple{N, <:Integer},
+                    scratch_dir = tempdir()) where {T, N}
+    if !isempty(scratch_dir) && isdir(scratch_dir)
+        arr = mktemp(scratch_dir) do mpath, mio
+            arr = mmap(mio, Array{T, N}, sz)
+            close(mio)
+            arr
+        end
+    else
+       arr = Array{T, N}(undef, sz)
+    end
+    arr
+end
+
+function convert_feather_video_frames_roi(input_fname; scratch_dir = tempdir(),
+                                          roi_x = :, roi_y = :)
+    outs = frame_iter_preamble(input_fname)
+    outs === nothing && return Array{N6f10, 3}()
+    inputvid, img_raw = outs
+    img_width, img_height = size(img_raw)
+    nframes = get_number_frames(input_fname)
+    nframes === nothing && error("Cointainer $input_fname does not report number of frames")
+    roi_xr, roi_yr = check_slices(img_raw, roi_x, roi_y)
+    nx = length(roi_xr)
+    ny = length(roi_yr)
+    imgs = maybe_mmap(N6f10, (nx, ny, nframes), scratch_dir)
+    convert_featherscope_img!(view(imgs, :, :, 1), view(img_raw, roi_xr, roi_yr))
+    for fno in 2:nframes
+        read!(inputvid, img_raw)
+        convert_featherscope_img!(view(imgs, :, :, fno),
+                                  view(img_raw, roi_xr, roi_yr))
+    end
+    imgs
 end
 
 end # module
