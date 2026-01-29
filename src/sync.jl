@@ -1,13 +1,17 @@
-function find_sync_edges(sync_pulses::AbstractVector{<:Number},
-                         sync_high::Number = FEATHER_SYNC_HIGH,)
+function find_sync_edges(
+    sync_pulses::AbstractVector{<:Number},
+    sync_high::Number = FEATHER_SYNC_HIGH,
+)
     find_all_edge_triggers(sync_pulses, sync_high / 2)
 end
 
 find_sync_edges(sync_data::AbstractMatrix, args...) =
     find_sync_edges(view(sync_data, 2, :), args...)
 
-function find_shutter_edges(shutter_signal::AbstractVector{<:Number},
-                               shutter_high = FEATHER_SHUTTER_HIGH)
+function find_shutter_edges(
+    shutter_signal::AbstractVector{<:Number},
+    shutter_high = FEATHER_SHUTTER_HIGH,
+)
     find_all_edge_triggers(shutter_signal, shutter_high / 2)
 end
 
@@ -57,14 +61,16 @@ Find the seconds of delay between the start of the sync file and the start of
 the video file. Negative values indicate that the sync file starts after the
 video file.
 """
-function video_sync_alignment(shutter_edges::AbstractVector{<:Integer},
-                              sync_edges::AbstractVector{<:Integer},
-                              sync_exposed_frameno::Integer,
-                              crossingno::Integer,
-                              framerate::Number;
-                              fs_sync::Number = 48000.0,
-                              shutter_skip_frames::Integer = 1,
-                              sync_jitter_s::Number = 0.002)
+function video_sync_alignment(
+    shutter_edges::AbstractVector{<:Integer},
+    sync_edges::AbstractVector{<:Integer},
+    sync_exposed_frameno::Integer,
+    crossingno::Integer,
+    framerate::Number;
+    fs_sync::Number = 48000.0,
+    shutter_skip_frames::Integer = 1,
+    sync_jitter_s::Number = 0.002,
+)
 
     if length(shutter_edges) < crossingno
         throw(ArgumentError("shutter_edges must be longer than crossingno"))
@@ -95,9 +101,14 @@ function video_sync_alignment(shutter_edges::AbstractVector{<:Integer},
     return rel_sync_start_time
 end
 
-function video_sync_alignment(syncdata::AbstractMatrix{<:AbstractFloat},
-                              args...; shutter_thr = 0.1, sync_thr = 0.1,
-                              fs_sync = 48000.0, kwargs...)
+function video_sync_alignment(
+    syncdata::AbstractMatrix{<:AbstractFloat},
+    args...;
+    shutter_thr = 0.1,
+    sync_thr = 0.1,
+    fs_sync = 48000.0,
+    kwargs...,
+)
     shutter_edges, sync_edges = shutter_sync_edges(syncdata, shutter_thr, sync_thr)
     video_sync_alignment(shutter_edges, sync_edges, args...; kwargs...)
 end
@@ -133,7 +144,7 @@ function outlier_is_compensated(ts_diffs, pos, maxnframe = 5; zero_tol = 0.1, su
     ts_diff_len = length(ts_diffs)
     @boundscheck 1 <= pos <= ts_diff_len || return false
     @inbounds running_sum = ts_diffs[pos]
-    for i in pos+1:min(ts_diff_len, pos + maxnframe)
+    for i = (pos+1):min(ts_diff_len, pos+maxnframe)
         # Stop running sum if timestamps have returned to baseline
         val = ts_diffs[i]
         if val >= -zero_tol || running_sum <= sum_tol
@@ -145,14 +156,23 @@ function outlier_is_compensated(ts_diffs, pos, maxnframe = 5; zero_tol = 0.1, su
 end
 
 "Check quality of featherscope files, synchronize them, and calculate framerate"
-function triplet_sync_info(vfname, sfname, tfname;
-                           fs_sync = 48000.0, shutter_thr = 0.1, sync_thr = 0.1,
-                           exposure_thr = 0.04, x = :, y = :,
-                           framerate_precision = 1//100,
-                           def_framerate = 741//25, sync_rat_tol = 0.05,
-                           timestamp_rat_tol = 0.8,
-                           skip_exposure_at_start = false,
-                           kwargs...)
+function triplet_sync_info(
+    vfname,
+    sfname,
+    tfname;
+    fs_sync = 48000.0,
+    shutter_thr = 0.1,
+    sync_thr = 0.1,
+    exposure_thr = 0.04,
+    x = :,
+    y = :,
+    framerate_precision = 1//100,
+    def_framerate = 741//25,
+    sync_rat_tol = 0.05,
+    timestamp_rat_tol = 0.8,
+    skip_exposure_at_start = false,
+    kwargs...,
+)
     syncdata = open_audio_sync(sfname)
     shutter_edges, sync_edges = shutter_sync_edges(syncdata, shutter_thr, sync_thr)
     triplet_ok = true
@@ -162,8 +182,7 @@ function triplet_sync_info(vfname, sfname, tfname;
         framerate_out = nothing
     else
         syncl = size(syncdata, 2)
-        extreme_per_rat, leading_gap, trailing_gap =
-            sync_sanity_check(sync_edges, syncl)
+        extreme_per_rat, leading_gap, trailing_gap = sync_sanity_check(sync_edges, syncl)
         if any(x -> x > sync_rat_tol, extreme_per_rat)
             @warn "Sync edges for $sfname fail quality control"
             empty!(sync_edges)
@@ -196,7 +215,8 @@ function triplet_sync_info(vfname, sfname, tfname;
         end
     end
     sync_exposed_frameno, crossingno, triplet_ok = try
-        sync_exposed_frameno, crossingno = find_first_exposure_edge(vfname, exposure_thr, x, y)
+        sync_exposed_frameno, crossingno =
+            find_first_exposure_edge(vfname, exposure_thr, x, y)
         sync_exposed_frameno, crossingno, triplet_ok
     catch err
         if err isa ErrorException && occursin("Could not open", err.msg)
@@ -213,11 +233,15 @@ function triplet_sync_info(vfname, sfname, tfname;
         rel_sync_start_time = nothing
         triplet_ok = false
     else
-        rel_sync_start_time = video_sync_alignment(shutter_edges, sync_edges,
-                                                   sync_exposed_frameno,
-                                                   crossingno, framerate;
-                                                   fs_sync = fs_sync,
-                                                   kwargs...)
+        rel_sync_start_time = video_sync_alignment(
+            shutter_edges,
+            sync_edges,
+            sync_exposed_frameno,
+            crossingno,
+            framerate;
+            fs_sync = fs_sync,
+            kwargs...,
+        )
         if rel_sync_start_time === nothing
             @warn "video_sync_alignment returned nothing for $vfname"
             triplet_ok = false
@@ -229,9 +253,9 @@ end
 "Call `triplet_sync_info` on a group of files"
 function sync_triplets(trips; kwargs...)
     nt = length(trips)
-    vid_offsets = Vector{Union{Nothing, Float64}}(undef, nt)
-    framerates = Vector{Union{Nothing, Rational{Int}}}(undef, nt)
-    triplets_ok = Vector{Union{Nothing, Bool}}(undef, nt)
+    vid_offsets = Vector{Union{Nothing,Float64}}(undef, nt)
+    framerates = Vector{Union{Nothing,Rational{Int}}}(undef, nt)
+    triplets_ok = Vector{Union{Nothing,Bool}}(undef, nt)
     for (i, (vf, sf, tf)) in enumerate(trips)
         @info "Synchronizing $vf"
         out = triplet_sync_info(vf, sf, tf; kwargs...)
